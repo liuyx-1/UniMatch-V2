@@ -1,0 +1,60 @@
+# arguments for dataset
+dataset: endoscapes_seg50
+data_root: /data/test/endoscapes_seg50_processed   # output of tools/prepare_endoscapes.py --no-pool
+nclass: 7
+crop_size: 490                                       # 14 * 35, fits 480-tall surgical frames
+
+# arguments for training
+epochs: 80
+batch_size: 4
+lr: 0.00001
+lr_multi: 10.0
+criterion:
+  name: CELoss
+  kwargs:
+    ignore_index: 255
+conf_thresh: 0.95
+
+# arguments for model
+model: dpt
+backbone: dinov2_base
+backbone_checkpoint: /data/code/UniMatch-V2-manifold/pretrained/dinov2_vitb14_pretrain.pth
+lock_backbone: False
+
+# === Enhancement toggles (overridden by --debias / --boundary CLI flags) ===
+debias:
+  enabled: false
+  tau: 1.0
+  tau_warmup_epochs: 5
+  running_decay: 0.99
+  init_from_labeled: true
+  prior_conf_thresh: 0.7
+  sync_ddp: true
+boundary:
+  enabled: false
+  alpha: 0.1
+  pos_weight: 20.0
+  dice_weight: 0.5             # 0=BCE only, 1=Dice only, 0.5=combo (recommended)
+  warmup_epochs: 3             # skip boundary loss for first N epochs (noisy preds)
+  cutmix_edge_thickness: 2     # px band around cutmix-paste seam to exclude
+  tangent_enabled: false       # CLI --tangent overrides; requires boundary.enabled
+  tangent_weight: 0.1
+  tangent_detach_seg: true
+cls:
+  enabled: false           # CLI --cls-head overrides
+  alpha: 0.1               # weight of the cls aux loss in total loss
+  decoder_type: ml_decoder # mlp | ml_decoder  (ML-Decoder: per-class queries, Ridnik WACV'23)
+  loss_type: asl           # asl | bce         (ASL: Ben-Baruch ICCV'21, robust to long tail)
+  detach_backbone: true    # stop cls grad from updating backbone (prevents aux from poisoning seg)
+  warmup_epochs: 5         # skip cls loss for first N epochs so seg head + prior stabilise
+  # head params
+  hidden: 512              # MLP only
+  num_heads: 8             # ML-Decoder only
+  dropout: 0.1
+  min_pixels: 32           # >= K pixels of a class for it to count as "present"
+  # ASL params (loss_type=asl)
+  asl_gamma_neg: 4.0       # focusing on negatives (down-weight easy)
+  asl_gamma_pos: 0.0       # 0 = full gradient on positives (rare classes need it)
+  asl_clip:      0.05      # probability shift on hard negatives
+  # BCE-only fallback (loss_type=bce)
+  pos_weight_tau: 0.5      # >0 + --debias => BCE pos_weight = (1/prior)^tau

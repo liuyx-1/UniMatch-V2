@@ -1,0 +1,57 @@
+# EndoVis2017 — parts task (4 classes: background / shaft / wrist / clasper)
+# 1280x1024 cropped frames, semi-supervised
+
+dataset: endovis2017_parts
+data_root: /data/test/endovis2017_parts_processed
+nclass: 4
+crop_size: 490                                          # 14 * 35 (DINOv2 patch=14)
+
+epochs: 80
+batch_size: 4
+lr: 1.0e-5
+lr_multi: 10.0
+criterion:
+  name: CELoss
+  kwargs:
+    ignore_index: 255
+conf_thresh: 0.95
+
+model: dpt
+backbone: dinov2_base
+backbone_checkpoint: /data/code/UniMatch-V2-manifold/pretrained/dinov2_vitb14_pretrain.pth
+lock_backbone: False
+
+# === Enhancement toggles ===
+debias:
+  enabled: false
+  tau: 1.0
+  tau_warmup_epochs: 5
+  running_decay: 0.99
+  init_from_labeled: true
+  prior_conf_thresh: 0.7
+  sync_ddp: true
+boundary:
+  enabled: false
+  alpha: 0.1
+  pos_weight: 25.0            # 4 类边界相对稀疏, pos_weight 稍高
+  dice_weight: 0.5
+  warmup_epochs: 3
+  cutmix_edge_thickness: 2
+  tangent_enabled: false
+  tangent_weight: 0.1
+  tangent_detach_seg: true
+cls:
+  enabled: false
+  alpha: 0.1
+  decoder_type: ml_decoder
+  loss_type: asl
+  detach_backbone: true
+  warmup_epochs: 5
+  hidden: 512
+  num_heads: 8
+  dropout: 0.1
+  min_pixels: 32
+  asl_gamma_neg: 4.0
+  asl_gamma_pos: 0.0
+  asl_clip: 0.05
+  pos_weight_tau: 0.5
