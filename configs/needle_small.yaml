@@ -1,0 +1,26 @@
+dataset: needle
+data_root: /root/autodl-tmp/data/autonomous_surgery/public_data/unimatchv2_needle_3class
+nclass: 3
+crop_size: 490
+
+epochs: 80
+batch_size: 4
+lr: 1.0e-5
+lr_multi: 10.0
+criterion:
+  name: CELoss
+  kwargs:
+    ignore_index: 255
+conf_thresh: 0.95
+
+model: dpt
+backbone: dinov2_small
+backbone_checkpoint: /root/autodl-tmp/code/UniMatch-V2/pretrained/dinov2_vits14_pretrain.pth
+lock_backbone: False
+
+debias:
+  enabled: false
+balance_reg:
+  enabled: false
+boundary:
+  enabled: false

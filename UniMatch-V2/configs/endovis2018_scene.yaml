@@ -1,0 +1,56 @@
+# EndoVis2018 — Scene segmentation (Surg-SegFormer 7-class remap)
+# Old 12 classes -> new 7:
+#   shaft+clasper+wrist -> robotic-instrument-part;
+#   thread / clamps / suction-instrument -> ignore (255)
+# Produced by tools/remap_endovis2018_scene.py
+
+dataset: endovis2018_scene
+data_root: /root/autodl-tmp/data/autonomous_surgery/public_data/endovis2018_scene_processed
+nclass: 7
+crop_size: 490                                       # 14 * 35  (override via CROP env)
+
+epochs: 80
+batch_size: 4
+lr: 1.0e-5
+lr_multi: 10.0
+criterion:
+  name: CELoss
+  kwargs:
+    ignore_index: 255
+conf_thresh: 0.95
+
+model: dpt
+backbone: dinov2_base
+backbone_checkpoint: /root/autodl-tmp/code/UniMatch-V2/pretrained/dinov2_vitb14_pretrain.pth
+lock_backbone: False
+
+# === Enhancement toggles (mirror endovis2018.yaml) ===
+balance_reg:
+  enabled: false
+  weight: 0.03
+  target: sqrt
+  apply_to: both
+boundary:
+  enabled: false
+  alpha: 0.1
+  pos_weight: 22.0                                   # fewer classes -> sparser boundary mass
+  dice_weight: 0.5
+  warmup_epochs: 3
+  cutmix_edge_thickness: 2
+  tangent_enabled: false
+  tangent_weight: 0.1
+  tangent_detach_seg: true
+cls:
+  enabled: false
+  alpha: 0.1
+  decoder_type: ml_decoder
+  loss_type: asl
+  detach_backbone: true
+  warmup_epochs: 5
+  hidden: 512
+  num_heads: 8
+  dropout: 0.1
+  min_pixels: 32
+  asl_gamma_neg: 4.0
+  asl_gamma_pos: 0.0
+  asl_clip: 0.05
