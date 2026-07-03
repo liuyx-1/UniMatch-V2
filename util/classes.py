@@ -72,6 +72,34 @@ CLASSES = {'pascal': ['background', 'aeroplane', 'bicycle', 'bird', 'boat', 'bot
                                   'small-intestine',
                                   'ultrasound-probe'],
 
+           # Surg-SegFormer Table-IV "Anatomy and Parts" 10-class breakdown of
+           # EndoVis 2018: merge shaft+wrist+clasper -> Robotic Instrument Part,
+           # but KEEP suturing-thread / clamps / suction-instrument (unlike _scene).
+           # Column order follows the paper's Table IV.
+           # Build with tools/remap_endovis2018_anatomy_parts.py.
+           'endovis2018_anatomy_parts': ['background-tissue',         # BT
+                                          'robotic-instrument-part',  # RI
+                                          'kidney-parenchyma',        # KP
+                                          'covered-kidney',           # CK
+                                          'small-intestine',          # SI
+                                          'suturing-thread',          # ST
+                                          'suturing-needle',          # SN
+                                          'clamps',                   # Clamps
+                                          'suction-instrument',       # Suction
+                                          'ultrasound-probe'],        # UP
+
+           # EndoVis2018 Task-2 instrument-type (Surg-SegFormer Table V), built from
+           # the Roboflow COCO export via tools/prepare_coco_seg.py. Index = COCO
+           # category_id (background = 0); names/order are the export's (alphabetical).
+           'endovis2018_type': ['background',
+                                'Bipolar Forceps',             # 1
+                                'Clip Applier',                # 2
+                                'Large Needle Driver',         # 3
+                                'Monopolar Curved Scissors',   # 4
+                                'Prograsp Forceps',            # 5
+                                'Suction Instrument',          # 6
+                                'Ultrasound Probe'],           # 7
+
            'endoscapes_seg50': ['background', 'cystic_plate', 'calot_triangle',
                                 'cystic_artery', 'cystic_duct', 'gallbladder',
                                 'tool'],
@@ -82,6 +110,15 @@ CLASSES = {'pascal': ['background', 'aeroplane', 'bicycle', 'bird', 'boat', 'bot
                                 'tool'],
 
            'needle': ['background', 'class_0', 'class_1'],
+
+           # a.mp4/b.mp4 suturing dataset: bg + 3 foreground classes (nclass=4).
+           # TODO: rename the 3 foreground entries to the real class names
+           # (mask value 1 -> index 1, value 2 -> index 2, value 3 -> index 3).
+           'ab': ['background', 'suturing-needle', 'suturing-thread', 'clamps'],
+
+           # Combined multi-video surgical set (ab + march_* + july_* + ...).
+           # All videos annotated with --classes needle,thread,clamps (ids 1,2,3).
+           'surgical_combined': ['background', 'needle', 'thread', 'clamps'],
 
            'cholecseg8k': ['background', 'abdominal_wall', 'liver',
                            'gastrointestinal_tract', 'fat', 'grasper',
@@ -114,3 +151,27 @@ CLASSES = {'pascal': ['background', 'aeroplane', 'bicycle', 'bird', 'boat', 'bot
                       'plate', 'monitor', 'bulletin board', 'shower', 'radiator', 'glass', 
                       'clock', 'flag']
            }
+
+
+# Paper-style short names used ONLY for per-class metric printing (Surg-SegFormer
+# Tables III/IV/V). Index-aligned to CLASSES[<dataset>]. Falls back to CLASSES
+# when a dataset is absent here. Does NOT affect data paths / matching.
+DISPLAY_NAMES = {
+    # Table IV — EndoVis2018 Anatomy and Parts (10)
+    'endovis2018_anatomy_parts': ['BT', 'RI', 'KP', 'CK', 'SI', 'ST', 'SN',
+                                  'Clamps', 'Suction', 'UP'],
+    # Table V — EndoVis2018 Tools Type (bg + 7); SI = Suction Instrument
+    'endovis2018_type': ['bg', 'BF', 'CA', 'LND', 'MCS', 'PF', 'SI', 'UP'],
+    # Table III — EndoVis2017 Tools Type (bg + 7)
+    'endovis2017_type': ['bg', 'BF', 'PF', 'LND', 'VS', 'GR', 'MCS', 'UP'],
+    # Table II — Parts 2018 scene (7); SI = Small Intestine here
+    'endovis2018_scene': ['BT', 'RI', 'KP', 'CK', 'SN', 'SI', 'UP'],
+}
+
+
+def display_names(dataset, nclass=None):
+    """Short paper names for printing; fall back to canonical CLASSES."""
+    names = DISPLAY_NAMES.get(dataset) or CLASSES.get(dataset)
+    if names is None and nclass is not None:
+        names = [f'cls{c}' for c in range(nclass)]
+    return names

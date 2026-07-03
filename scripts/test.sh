@@ -52,6 +52,14 @@ if [ "$VARIANT" = "affinity" ] || [ "$VARIANT" = "affinity_min" ] || [ "$VARIANT
 fi
 [ -n "${BACKBONE:-}" ] && EXTRA_TEST="$EXTRA_TEST --backbone $BACKBONE"
 
+# --ap / --ece accumulate per-pixel float arrays over the WHOLE test set in
+# host RAM. On large high-res sets (endovis2018, cholecseg8k) this can OOM the
+# container. Default ON; set AP=0 and/or ECE=0 to disable.
+AP=${AP:-1}
+ECE=${ECE:-1}
+[ "$AP" = "1" ]  && EXTRA_TEST="$EXTRA_TEST --ap"
+[ "$ECE" = "1" ] && EXTRA_TEST="$EXTRA_TEST --ece"
+
 DEVICE=${DEVICE:-cuda:0}
 
 python test.py \
@@ -61,8 +69,6 @@ python test.py \
     --train-id-path ${SPLIT_ROOT}/labeled.txt \
     --train-freq-cache ${save_path}/train_pixel_freq_test.json \
     --use-ema \
-    --ece \
-    --ap \
     --device $DEVICE \
     --save-csv ${save_path}/test_metrics.csv \
     $EXTRA_TEST

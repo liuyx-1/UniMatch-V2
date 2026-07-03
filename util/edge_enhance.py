@@ -85,6 +85,19 @@ def edge_to_tokens(edge: torch.Tensor, patch_h: int, patch_w: int) -> torch.Tens
     return e.flatten(2).transpose(1, 2).contiguous()
 
 
+@torch.no_grad()
+def _valid_without_ignore_halo(mask: torch.Tensor, ignore_index: int = 255,
+                               ignore_dilation: int = 0) -> torch.Tensor:
+    valid = (mask != ignore_index).unsqueeze(1).float()
+    dilation = max(0, int(ignore_dilation))
+    if dilation <= 0:
+        return valid
+    ignore = (mask == ignore_index).unsqueeze(1).float()
+    k = 2 * dilation + 1
+    halo = F.max_pool2d(ignore, kernel_size=k, stride=1, padding=dilation)
+    return valid * (1.0 - halo)
+
+
 # ----------------------------------------------------------------------
 # NEW: Mask-Guided Edge Refiner (MGER)
 # ----------------------------------------------------------------------
@@ -95,7 +108,7 @@ class MaskGuidedEdgeRefiner(nn.Module):
     Architecture (depth-separable, ~1k params at mid=16):
         cat(img, edge) -> 3x3 conv -> GN -> GELU
                       -> 3x3 depthwise -> 1x1 pointwise -> GN -> GELU
-                      -> Dropout2d -> 3x3 conv -> sigmoid
+                      -> Dropout -> 3x3 conv -> sigmoid
 
     Output is zero-initialized (last conv weight = 0, bias = -1.5) so at
     epoch 0 the refined edge is nearly uniform (~ sigmoid(-1.5) = 0.18),
@@ -145,7 +158,8 @@ class MaskGuidedEdgeRefiner(nn.Module):
 # ----------------------------------------------------------------------
 def _gt_boundary_target(mask: torch.Tensor, num_classes: int,
                          ignore_index: int = 255,
-                         thickness: int = 3) -> torch.Tensor:
+                         thickness: int = 3,
+                         ignore_dilation: int = 0) -> torch.Tensor:
     """Soft binary boundary target derived from a class-id mask.
 
     Pixels are 1 if their class differs from any 4-neighbor, then dilated
@@ -154,7 +168,7 @@ def _gt_boundary_target(mask: torch.Tensor, num_classes: int,
     """
     if mask.ndim != 3:
         raise ValueError(f'expected mask [B,H,W], got {tuple(mask.shape)}')
-    valid = (mask != ignore_index).unsqueeze(1).float()
+    valid = _valid_without_ignore_halo(mask, ignore_index, ignore_dilation)
     # encode each class as a one-hot channel, max-pool diff against 4-neighbors
     # (cheaper than full Sobel-per-class)
     safe = torch.where(mask == ignore_index, torch.zeros_like(mask), mask)
@@ -179,6 +193,7 @@ def refined_edge_loss(refined: torch.Tensor,
                        dice_weight: float = 0.5,
                        pos_weight: float = 8.0,
                        valid_mask: Optional[torch.Tensor] = None,
+                       ignore_dilation: int = 0,
                        eps: float = 1.0) -> torch.Tensor:
     """BCE + Dice between MGER output and a GT mask boundary.
 
@@ -192,13 +207,16 @@ def refined_edge_loss(refined: torch.Tensor,
                        training).
         valid_mask  : optional [B,H,W] {0,1} additional gate (e.g. exclude
                        cutmix seams or low-conf pseudo regions).
+        ignore_dilation: remove this many pixels around ignore_index regions
+                         from target and loss gate.
     """
-    target = _gt_boundary_target(mask, num_classes, ignore_index, thickness)
+    target = _gt_boundary_target(mask, num_classes, ignore_index, thickness,
+                                 ignore_dilation=ignore_dilation)
     if refined.shape[-2:] != target.shape[-2:]:
         refined = F.interpolate(refined, size=target.shape[-2:],
                                  mode='bilinear', align_corners=False)
     p = refined.clamp(1e-5, 1 - 1e-5)
-    gate = (mask != ignore_index).unsqueeze(1).float().to(p.dtype)
+    gate = _valid_without_ignore_halo(mask, ignore_index, ignore_dilation).to(p.dtype)
     if valid_mask is not None:
         v = valid_mask.float().to(p.dtype)
         if v.ndim == 2:                                  # [H,W]
@@ -237,7 +255,7 @@ class EdgeTextResidualAdapter(nn.Module):
     """
 
     def __init__(self, dim: int, dropout: float = 0.0,
-                 gate_dropout: float = 0.05):
+                 gate_dropout: float = 0.0):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.proj = nn.Sequential(
@@ -272,7 +290,7 @@ class EdgeSegResidualAdapter(nn.Module):
     """
 
     def __init__(self, dim: int, dropout: float = 0.0,
-                 gate_dropout: float = 0.05):
+                 gate_dropout: float = 0.0):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.proj = nn.Sequential(

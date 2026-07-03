@@ -256,8 +256,9 @@ class DinoVisionTransformer(nn.Module):
 
         x = self.prepare_tokens_with_masks(x, masks)
 
+        _ckpt = getattr(self, 'grad_checkpointing', False) and torch.is_grad_enabled()
         for blk in self.blocks:
-            x = blk(x)
+            x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False) if _ckpt else blk(x)
 
         x_norm = self.norm(x)
         return {
@@ -273,12 +274,23 @@ class DinoVisionTransformer(nn.Module):
         # If n is an int, take the n last blocks. If it's a list, take them
         output, total_block_len = [], len(self.blocks)
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
+        _ckpt = getattr(self, 'grad_checkpointing', False) and torch.is_grad_enabled()
+        _rein = getattr(self, '_rein', None)   # Rein-style PEFT (None unless enabled)
         for i, blk in enumerate(self.blocks):
-            x = blk(x)
+            x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False) if _ckpt else blk(x)
+            if _rein is not None:
+                x = _rein(i, x)
             if i in blocks_to_take:
                 output.append(x)
         assert len(output) == len(blocks_to_take), f"only {len(output)} / {len(blocks_to_take)} blocks found"
         return output
+
+    def set_grad_checkpointing(self, flag: bool = True):
+        """Gradient-checkpoint the transformer blocks: trade a re-forward in the
+        backward pass for much lower activation memory, with NO change to
+        resolution or batch size. Effective only when the backbone is trainable;
+        a no-op under eval (grad disabled) thanks to the torch.is_grad_enabled() guard."""
+        self.grad_checkpointing = bool(flag)
 
     def _get_intermediate_layers_chunked(self, x, n=1):
         x = self.prepare_tokens_with_masks(x)

@@ -125,7 +125,8 @@ class AffinitySideBranch(nn.Module):
     def __init__(self, ckpt_path: str = None, n_orig_classes: int = None,
                  gate_bias_init: float = -3.0, class_names=None,
                  dataset: str = 'unknown',
-                 model_name: str = 'google/siglip2-base-patch16-256'):
+                 model_name: str = 'google/siglip2-base-patch16-256',
+                 match_prior_scale: bool = True):
         super().__init__()
         if isinstance(ckpt_path, dict):
             ckpt = ckpt_path
@@ -138,6 +139,12 @@ class AffinitySideBranch(nn.Module):
                                          dataset=dataset, model_name=model_name)
             self.ckpt_path = '<joint-init-from-class-names>'
         self.dataset = ckpt.get('dataset', 'unknown')
+        # Moment-match the affinity prior to the DPT logit scale before the gated
+        # convex fusion. The raw prior lives at A = cos/tau ~ ±1/0.07 ≈ ±14, while
+        # DPT logits are ~±5-10, so without this the convex combination is dominated
+        # by the prior as soon as the gate opens past ~0.05. Persisted in the ckpt so
+        # train (here) and eval (test.py) always use the same fusion. Parameter-free.
+        self.match_prior_scale = bool(ckpt.get('match_prior_scale', match_prior_scale))
 
         d_text   = 768
         d_latent = int(ckpt.get('d_latent', 128))
@@ -262,14 +269,47 @@ class AffinitySideBranch(nn.Module):
         self._proj_unfrozen = False
         self.edge_text_adapter = None
 
-    def enable_edge_enhance(self, dropout: float = 0.0):
+    def enable_edge_enhance(self, dropout: float = 0.0,
+                            gate_dropout: float = 0.0):
         if self.edge_text_adapter is None:
-            self.edge_text_adapter = EdgeTextResidualAdapter(self.d_latent, dropout=dropout)
+            self.edge_text_adapter = EdgeTextResidualAdapter(
+                self.d_latent, dropout=dropout, gate_dropout=gate_dropout)
 
     def edge_parameters(self):
         if self.edge_text_adapter is None:
             return []
         return list(self.edge_text_adapter.parameters())
+
+    def moe_text_condition(self, patches: torch.Tensor, patch_hw=None,
+                           edge_prior: torch.Tensor = None) -> torch.Tensor:
+        """Return the per-token LC-PAM visual/text latent used to condition
+        HPTA-MoE routing.
+
+        This is intentionally a lightweight side output, not a replacement for
+        ``forward``: the segmentation trainer still calls ``forward`` later to
+        produce dense priors, gates, and image-level logits. Callers normally
+        detach/no_grad this tensor so MoE routing is conditioned on the current
+        LC-PAM signal without adding a second DDP/autograd path through the text
+        branch.
+        """
+        B, N, _ = patches.shape
+        if patch_hw is None:
+            side = int(round(N ** 0.5))
+            patch_h, patch_w = side, side
+        else:
+            patch_h, patch_w = [int(v) for v in patch_hw]
+        if patch_h * patch_w != N:
+            raise RuntimeError(
+                f"AffinitySideBranch text-cond grid mismatch: patch_h*patch_w="
+                f"{patch_h}*{patch_w} but got N={N} patch tokens."
+            )
+        edge_tokens = None
+        if edge_prior is not None:
+            edge_tokens = edge_to_tokens(edge_prior, patch_h, patch_w)
+        p_lat = F.normalize(self.visual_proj(patches), dim=-1)
+        if self.edge_text_adapter is not None and edge_tokens is not None:
+            p_lat = F.normalize(self.edge_text_adapter(p_lat, edge_tokens), dim=-1)
+        return p_lat
 
     # ---- freeze / unfreeze proj group ----
     def freeze_proj(self):
@@ -442,9 +482,26 @@ class AffinitySideBranch(nn.Module):
         }
 
     def fuse(self, dpt_logits: torch.Tensor, side_out: dict) -> torch.Tensor:
-        """Per-pixel gated fusion. Bg channels untouched (mask zeros their gate)."""
-        eff_gate = side_out['gate'] * side_out['non_bg_mask']
-        return (1.0 - eff_gate) * dpt_logits + eff_gate * side_out['prior']
+        """Per-pixel gated fusion. Bg channels untouched (mask zeros their gate).
+
+        When ``match_prior_scale`` is set, the prior is affinely rescaled — per
+        pixel, over the active (non-bg) channels — to the DPT logits' mean/std
+        before mixing. This keeps the convex combination scale-consistent
+        (a single per-pixel scale+shift preserves the prior's argmax/ranking,
+        only its magnitude is matched to the DPT logits).
+        """
+        non_bg = side_out['non_bg_mask']                 # [1, C, 1, 1] 1=non-bg
+        eff_gate = side_out['gate'] * non_bg
+        prior = side_out['prior']
+        if self.match_prior_scale:
+            m = non_bg.to(prior.dtype)
+            n = m.sum(dim=1, keepdim=True).clamp_min(1.0)
+            p_mean = (prior * m).sum(1, keepdim=True) / n
+            p_std = (((prior - p_mean) ** 2 * m).sum(1, keepdim=True) / n + 1e-6).sqrt()
+            d_mean = (dpt_logits * m).sum(1, keepdim=True) / n
+            d_std = (((dpt_logits - d_mean) ** 2 * m).sum(1, keepdim=True) / n + 1e-6).sqrt()
+            prior = ((prior - p_mean) / p_std * d_std + d_mean) * m
+        return (1.0 - eff_gate) * dpt_logits + eff_gate * prior
 
     # ---- checkpoint helpers ----
     def state_dict_for_save(self):
@@ -465,6 +522,7 @@ class AffinitySideBranch(nn.Module):
             'proj_unfrozen': bool(self._proj_unfrozen),
             'idx_orig_to_new': self.idx_orig_to_new.detach().cpu(),
             'affinity_metric': self.affinity_metric,
+            'match_prior_scale': bool(self.match_prior_scale),
             'hyperbolic_eps':            self.hyperbolic_eps,
             'hyperbolic_distance_scale': self.hyperbolic_distance_scale,
             'hyperbolic_dim':            self.d_hyperbolic,
@@ -482,6 +540,8 @@ class AffinitySideBranch(nn.Module):
         return sd
 
     def load_state_dict_from_save(self, sd):
+        if 'match_prior_scale' in sd:
+            self.match_prior_scale = bool(sd['match_prior_scale'])
         self.visual_proj.load_state_dict(sd['visual_proj'])
         self.T_anchor.data.copy_(sd['T_anchor'])
         self.log_tau.data.copy_(sd['log_tau'])

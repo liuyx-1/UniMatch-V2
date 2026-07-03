@@ -66,6 +66,10 @@ CLASS_NAMES = {
         'Large Needle Driver', 'Vessel Sealer', 'Grasping Retractor',
         'Monopolar Curved Scissors', 'Ultrasound Probe',
     ],
+    # Surgical multi-video set; mirrors util/classes.py. Note: its splits live
+    # outside the unimatch_splits_{ds}_{rate}_seed{seed} convention, so build its
+    # manifests with tools/build_surgical_combined_manifest.py, not this script.
+    'surgical_combined': ['background', 'needle', 'thread', 'clamps'],
 }
 
 # Per-dataset hard-prompt template (used later in soft prompt training as
@@ -76,6 +80,7 @@ PROMPT_TEMPLATE = {
     'endovis2018':       '{cls} during robotic kidney surgery',
     'endovis2017_parts': 'the {cls} part of a surgical instrument',
     'endovis2017_type':  'a {cls} surgical instrument',
+    'surgical_combined': '{cls} during robotic surgical suturing',
 }
 
 # Default thresholds (mirror cls_target_from_mask in util/cls_head.py)

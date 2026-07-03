@@ -160,6 +160,18 @@ TEMPLATES: Dict[str, List[str]] = {
         'monofilament thread used for tissue approximation',
         'dark suture thread emerging from a tissue site',
     ],
+    'suturing_thread': [
+        'a surgical suture thread, thin and usually dark or blue',
+        'a single strand of suture material in the surgical field',
+        'monofilament suturing thread used for tissue approximation',
+        'dark suture thread trailing from a surgical needle',
+    ],
+    'needle': [
+        'a small curved metallic suturing needle in the surgical field',
+        'a crescent-shaped silver surgical needle, often held by a clamp',
+        'a shiny curved needle near a suture thread during suturing',
+        'half-circle reflective metal suture needle in an endoscopic view',
+    ],
     'clamps': [
         'a surgical clamp grasping tissue or a vessel',
         'metallic clamp applied for hemostasis during dissection',
@@ -238,7 +250,8 @@ def _check_coverage():
         'abdominal_wall', 'liver', 'gastrointestinal_tract', 'fat', 'grasper', 'connective_tissue',
         'blood', 'l_hook_electrocautery', 'hepatic_vein', 'liver_ligament',
         'shaft', 'clasper', 'wrist', 'kidney_parenchyma', 'covered_kidney',
-        'thread', 'clamps', 'suturing_needle', 'suction_instrument', 'small_intestine',
+        'thread', 'suturing_thread', 'needle', 'clamps', 'suturing_needle',
+        'suction_instrument', 'small_intestine',
         'ultrasound_probe',
         'bipolar_forceps', 'prograsp_forceps', 'large_needle_driver', 'vessel_sealer',
         'grasping_retractor', 'monopolar_curved_scissors',

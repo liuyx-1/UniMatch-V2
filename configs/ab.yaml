@@ -1,0 +1,28 @@
+# Custom 2-video dataset (a.mp4 / b.mp4), 3 foreground classes + background.
+# Built by tools/extract_frames.py + tools/build_unimatch_splits.py in SAM2-Plus.
+dataset: ab
+data_root: /root/autodl-tmp/code/ab_dataset   # server path
+nclass: 4                                  # background(0) + 3 foreground classes
+crop_size: 490
+
+# arguments for training
+epochs: 60
+batch_size: 4
+lr: 0.00001
+lr_multi: 10.0
+criterion:
+  name: CELoss
+  kwargs:
+    ignore_index: 255
+conf_thresh: 0.95
+
+# arguments for model
+model: dpt
+backbone: dinov2_base
+backbone_checkpoint: /root/autodl-tmp/code/UniMatch-V2_local/pretrained/dinov2_vitb14_pretrain.pth
+lock_backbone: False
+
+boundary:
+  enabled: false
+cls:
+  enabled: false

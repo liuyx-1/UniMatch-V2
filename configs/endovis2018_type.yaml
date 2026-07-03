@@ -1,14 +1,14 @@
-# Needle semantic segmentation, converted from SAM2-Plus annotations.
-# Masks are uint8 PNG with class ids:
-# 0=background, 1=class_0, 2=class_1, 255=ignore.
+# EndoVis2018 Task 2 - instrument-type segmentation (Surg-SegFormer Table V).
+# 7 instrument types + background (= 8 classes). Built from the Roboflow COCO
+# export with tools/prepare_coco_seg.py (800x800 frames).
 
-dataset: needle
-data_root: /root/autodl-tmp/data/autonomous_surgery/public_data/unimatchv2_needle_3class
-nclass: 3
-crop_size: 490
+dataset: endovis2018_type
+data_root: /root/autodl-tmp/data/autonomous_surgery/public_data/endovis2018_type_processed
+nclass: 8
+crop_size: 490                                     # 14 * 35 (random crop from 800x800)
 
 epochs: 80
-batch_size: 2
+batch_size: 4
 lr: 1.0e-5
 lr_multi: 10.0
 criterion:
@@ -22,6 +22,7 @@ backbone: dinov2_base
 backbone_checkpoint: /root/autodl-tmp/code/UniMatch-V2_local/pretrained/dinov2_vitb14_pretrain.pth
 lock_backbone: False
 
+# === Enhancement toggles (mirror endovis configs) ===
 balance_reg:
   enabled: false
   weight: 0.03
@@ -30,7 +31,7 @@ balance_reg:
 boundary:
   enabled: false
   alpha: 0.1
-  pos_weight: 10.0
+  pos_weight: 16.0
   dice_weight: 0.5
   warmup_epochs: 3
   cutmix_edge_thickness: 2

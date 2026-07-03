@@ -58,6 +58,9 @@ CLASS_NAMES = {
     'endovis2017_type': ['background', 'Bipolar Forceps', 'Prograsp Forceps',
                           'Large Needle Driver', 'Vessel Sealer', 'Grasping Retractor',
                           'Monopolar Curved Scissors', 'Ultrasound Probe'],
+    # Surgical multi-video set (needle/thread/clamps); mirrors util/classes.py.
+    # Anchors come from tools/class_templates.py (needle/thread/clamps keys).
+    'surgical_combined': ['background', 'needle', 'thread', 'clamps'],
 }
 
 

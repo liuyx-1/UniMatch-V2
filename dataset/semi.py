@@ -42,6 +42,10 @@ class SemiDataset(Dataset):
         img = Image.open(os.path.join(self.root, img_rel)).convert('RGB')
         if self.mode == 'train_u':
             mask = Image.fromarray(np.zeros((img.size[1], img.size[0]), dtype=np.uint8))
+        elif mask_rel is None:
+            # No ground truth (e.g. an unlabeled video): all-ignore mask (255).
+            # Inference (--save-preds) still works; metrics simply skip these pixels.
+            mask = Image.fromarray(np.full((img.size[1], img.size[0]), 255, dtype=np.uint8))
         else:
             mask = Image.fromarray(np.array(Image.open(os.path.join(self.root, mask_rel))))
         

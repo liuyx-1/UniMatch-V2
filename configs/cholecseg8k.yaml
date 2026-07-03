@@ -18,7 +18,7 @@ conf_thresh: 0.95
 # arguments for model
 model: dpt
 backbone: dinov2_base
-backbone_checkpoint: /root/autodl-tmp/code/UniMatch-V2/pretrained/dinov2_vitb14_pretrain.pth
+backbone_checkpoint: /root/autodl-tmp/code/UniMatch-V2_local/pretrained/dinov2_vitb14_pretrain.pth
 lock_backbone: False
 
 boundary:

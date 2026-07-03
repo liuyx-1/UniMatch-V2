@@ -1,0 +1,27 @@
+# Combined multi-video surgical segmentation set (ab + march_* + july_* + ...).
+# Built by SAM2-Plus/tools/build_combined_trainset.py with per-video 8:2 split.
+# Split list lines are "ds/images/..jpg<TAB>ds/masks/..png" relative to data_root.
+dataset: surgical_combined
+data_root: /root/autodl-tmp/data/surgical_seg      # unified root (contains ab/, march_1/, ...)
+nclass: 4                                          # background + needle/thread/clamps
+crop_size: 490
+
+epochs: 150
+batch_size: 4
+lr: 0.00001
+lr_multi: 10.0
+criterion:
+  name: CELoss
+  kwargs:
+    ignore_index: 255
+conf_thresh: 0.95
+
+model: dpt
+backbone: dinov2_base
+backbone_checkpoint: /root/autodl-tmp/code/UniMatch-V2_local/pretrained/dinov2_vitb14_pretrain.pth
+lock_backbone: False
+
+boundary:
+  enabled: false
+cls:
+  enabled: false

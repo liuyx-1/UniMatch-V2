@@ -109,9 +109,12 @@ if [ "$VARIANT" = "affinity" ] || [ "$VARIANT" = "affinity_min" ] || [ "$VARIANT
     fi
     [ -n "$AFFINITY_WARMSTART" ] && FLAGS="$FLAGS --affinity-warmstart $AFFINITY_WARMSTART"
     [ -n "$AFFINITY_AUX_WEIGHT" ]    && FLAGS="$FLAGS --affinity-aux-weight $AFFINITY_AUX_WEIGHT"
+    [ -n "$AFFINITY_AUX_MIN_PIXELS" ] && FLAGS="$FLAGS --affinity-aux-min-pixels $AFFINITY_AUX_MIN_PIXELS"
     [ -n "$AFFINITY_FREEZE_WARMUP" ] && FLAGS="$FLAGS --affinity-freeze-warmup $AFFINITY_FREEZE_WARMUP"
     [ -n "$AFFINITY_PLATEAU_EPS" ]   && FLAGS="$FLAGS --affinity-plateau-eps $AFFINITY_PLATEAU_EPS"
     [ -n "$AFFINITY_UNFREEZE_LR_MULT" ] && FLAGS="$FLAGS --affinity-unfreeze-lr-mult $AFFINITY_UNFREEZE_LR_MULT"
+    # ablation: revert the LC-PAM prior moment-matching (default is matched)
+    [ "${NO_MATCH_PRIOR_SCALE:-0}" = "1" ] && FLAGS="$FLAGS --no-match-prior-scale"
 fi
 
 [ -n "$LR" ]     && FLAGS="$FLAGS --lr $LR"
@@ -120,11 +123,26 @@ fi
 [ "${VISUAL_ADAPTER:-0}" = "1" ] && FLAGS="$FLAGS --visual-adapter"
 [ -n "${VISUAL_ADAPTER_REDUCTION:-}" ] && FLAGS="$FLAGS --visual-adapter-reduction $VISUAL_ADAPTER_REDUCTION"
 [ -n "${VISUAL_ADAPTER_DROPOUT:-}" ] && FLAGS="$FLAGS --visual-adapter-dropout $VISUAL_ADAPTER_DROPOUT"
+# ---- HPTA-MoE (4-expert token routing) ----
+[ "${VA_MOE:-0}" = "1" ] && FLAGS="$FLAGS --visual-adapter-moe"
+[ "${MOE_EDGE_COND:-0}" = "1" ] && FLAGS="$FLAGS --moe-edge-cond"
+[ -n "${MOE_TEXT_COND_DIM:-}" ] && FLAGS="$FLAGS --moe-text-cond-dim $MOE_TEXT_COND_DIM"
+# ---- Rein-style in-backbone PEFT (frozen DINOv2) ----
+[ "${REIN:-0}" = "1" ] && FLAGS="$FLAGS --rein"
+[ -n "${REIN_TOKENS:-}" ] && FLAGS="$FLAGS --rein-tokens $REIN_TOKENS"
+[ -n "${REIN_RANK:-}" ] && FLAGS="$FLAGS --rein-rank $REIN_RANK"
+[ -n "${REIN_DIM:-}" ] && FLAGS="$FLAGS --rein-dim $REIN_DIM"
+[ -n "${REIN_DROPOUT:-}" ] && FLAGS="$FLAGS --rein-dropout $REIN_DROPOUT"
+[ -n "${REIN_LAYERS:-}" ] && FLAGS="$FLAGS --rein-layers $REIN_LAYERS"
+# ---- per-epoch delta checkpoints (frozen-backbone / PEFT rows) ----
+[ "${SAVE_EPOCH_DELTAS:-0}" = "1" ] && FLAGS="$FLAGS --save-epoch-deltas"
 [ "${JOINT_TEXT_STAGE:-0}" = "1" ] && FLAGS="$FLAGS --joint-text-stage"
 [ -n "${JOINT_TEXT_LR_MULT:-}" ] && FLAGS="$FLAGS --joint-text-lr-mult $JOINT_TEXT_LR_MULT"
 [ -n "${JOINT_TEXT_WARMUP:-}" ] && FLAGS="$FLAGS --joint-text-warmup $JOINT_TEXT_WARMUP"
 [ "${EDGE_ENHANCE:-0}" = "1" ] && FLAGS="$FLAGS --edge-enhance"
+[ "${EDGE_RESIDUAL_ADAPTERS:-0}" = "1" ] && FLAGS="$FLAGS --edge-residual-adapters"
 [ -n "${EDGE_BOUNDARY_WEIGHT:-}" ] && FLAGS="$FLAGS --edge-boundary-weight $EDGE_BOUNDARY_WEIGHT"
+[ -n "${EDGE_BOUNDARY_POS_WEIGHT:-}" ] && FLAGS="$FLAGS --edge-boundary-pos-weight $EDGE_BOUNDARY_POS_WEIGHT"
 [ -n "${EDGE_CONSISTENCY_WEIGHT:-}" ] && FLAGS="$FLAGS --edge-consistency-weight $EDGE_CONSISTENCY_WEIGHT"
 [ -n "${EDGE_WARMUP:-}" ] && FLAGS="$FLAGS --edge-warmup $EDGE_WARMUP"
 # ---- Mask-Guided Edge Refiner (MGER) ----
@@ -148,6 +166,13 @@ fi
 [ -n "${TSMDR_RADIUS:-}" ] && FLAGS="$FLAGS --tsmdr-radius $TSMDR_RADIUS"
 [ "${TSMDR_USE_EDGE:-0}" = "1" ] && FLAGS="$FLAGS --tsmdr-use-edge"
 [ "${TSMDR_SHAPE_ONLY:-0}" = "1" ] && FLAGS="$FLAGS --tsmdr-shape-only"
+# ---- Routed Consistency (TMRC: unified TCR / TS-MDR) ----
+[ "${ROUTED_CONSISTENCY:-0}" = "1" ] && FLAGS="$FLAGS --routed-consistency"
+[ -n "${ROUTE:-}" ] && FLAGS="$FLAGS --route $ROUTE"
+[ -n "${CONSISTENCY_WEIGHT:-}" ] && FLAGS="$FLAGS --consistency-weight $CONSISTENCY_WEIGHT"
+[ -n "${CONSISTENCY_BETA:-}" ] && FLAGS="$FLAGS --consistency-beta $CONSISTENCY_BETA"
+[ -n "${CONSISTENCY_WARMUP:-}" ] && FLAGS="$FLAGS --consistency-warmup $CONSISTENCY_WARMUP"
+[ "${CONSISTENCY_USE_EDGE:-0}" = "1" ] && FLAGS="$FLAGS --consistency-use-edge"
 [ -n "$EXTRA" ]  && FLAGS="$FLAGS $EXTRA"
 
 RATE=${RATE:-0.25}                     # label rate: 0.10 | 0.20 | 0.25 | 0.30 | 0.50
@@ -158,6 +183,18 @@ config=configs/${DATASET}.yaml
 labeled_id_path=${SPLIT_ROOT}/labeled.txt
 unlabeled_id_path=${SPLIT_ROOT}/unlabeled.txt
 val_id_path=${SPLIT_ROOT}/val.txt
+# Optional held-out test split, evaluated each epoch alongside val. If absent,
+# the trainer reuses the val metrics as "test".
+test_id_path=${SPLIT_ROOT}/test.txt
+[ -f "$test_id_path" ] && FLAGS="$FLAGS --test-id-path $test_id_path"
+[ -n "${EVAL_INTERVAL:-}" ] && FLAGS="$FLAGS --eval-interval $EVAL_INTERVAL"
+[ -n "${TEST_INTERVAL:-}" ] && FLAGS="$FLAGS --test-interval $TEST_INTERVAL"
+[ -n "${EVAL_BS:-}" ] && FLAGS="$FLAGS --eval-batch-size $EVAL_BS"
+[ -n "${EVAL_SIZE:-}" ] && FLAGS="$FLAGS --eval-size $EVAL_SIZE"
+[ "${EVAL_EMA_ONLY:-0}" = "1" ] && FLAGS="$FLAGS --eval-ema-only"
+# present-only means / best-selection: drop these class ids (space-separated).
+# Default auto = [0] for endovis2017_*, none elsewhere (set by the trainer).
+[ -n "${EXCLUDE_CLASSES:-}" ] && FLAGS="$FLAGS --exclude-classes $EXCLUDE_CLASSES"
 
 USER_TAG=${TAG:-}
 make_tag() {
@@ -184,6 +221,7 @@ make_tag() {
     [ "${TEMPORAL_CONSISTENCY:-0}" = "1" ] && [ "${TEMPORAL_ORIGINAL:-0}" = "1" ] && tag="${tag}v1"
     [ "${TSMDR:-0}" = "1" ] && tag="${tag}_tsmdr"
     [ "${TSMDR:-0}" = "1" ] && [ "${TSMDR_SHAPE_ONLY:-0}" = "1" ] && tag="${tag}shape"
+    [ "${ROUTED_CONSISTENCY:-0}" = "1" ] && tag="${tag}_tmrc${ROUTE:+_$ROUTE}"
     printf '%s\n' "$tag"
 }
 

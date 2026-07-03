@@ -392,7 +392,7 @@ class AffinityClassifier(nn.Module):
         LOCAL_CANDIDATES = [
             os.environ.get('DINOV2_VITB14_PATH', ''),
             './pretrained/dinov2_vitb14_pretrain.pth',
-            '/root/autodl-tmp/code/UniMatch-V2/pretrained/dinov2_vitb14_pretrain.pth',
+            '/root/autodl-tmp/code/UniMatch-V2_local/pretrained/dinov2_vitb14_pretrain.pth',
             '/data/code/UniMatch-V2/pretrained/dinov2_vitb14_pretrain.pth',
             '/data/code/UniMatch-V2-manifold/pretrained/dinov2_vitb14_pretrain.pth',
             '/data/pretrained/dinov2_vitb14_pretrain.pth',

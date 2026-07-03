@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from model.backbone.dinov2 import DINOv2
 from model.visual_adapter import DinoDPTAdapter
+from model.visual_adapter_moe import DinoDPTAdapterMoE
 from model.util.blocks import FeatureFusionBlock, _make_scratch
 
 
@@ -133,6 +134,7 @@ class DPT(nn.Module):
         
         self.head = DPTHead(nclass, self.backbone.embed_dim, features, use_bn, out_channels=out_channels)
         self.visual_adapter = None
+        self.rein = None
         
         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
         
@@ -140,17 +142,61 @@ class DPT(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-    def enable_visual_adapter(self, reduction=8, dropout=0.0):
-        self.visual_adapter = DinoDPTAdapter(
-            self.backbone.embed_dim,
-            num_layers=len(self.intermediate_layer_idx[self.encoder_size]),
-            reduction=reduction,
-            dropout=dropout,
-        )
+    def enable_visual_adapter(self, reduction=8, dropout=0.0, moe=False,
+                              moe_edge_cond=False, moe_text_cond_dim=0):
+        n_feat = len(self.intermediate_layer_idx[self.encoder_size])
+        if moe:
+            self._va_is_moe = True
+            self._moe_edge_cond_dim = 1 if moe_edge_cond else 0
+            self._moe_text_cond_dim = int(moe_text_cond_dim)
+            self._text_cond = None
+            self.visual_adapter = DinoDPTAdapterMoE(
+                self.backbone.embed_dim, num_layers=n_feat,
+                reduction=reduction, dropout=dropout,
+                text_cond_dim=self._moe_text_cond_dim,
+                edge_cond_dim=self._moe_edge_cond_dim,
+            )
+        else:
+            self._va_is_moe = False
+            self.visual_adapter = DinoDPTAdapter(
+                self.backbone.embed_dim, num_layers=n_feat,
+                reduction=reduction, dropout=dropout,
+            )
 
-    def adapt_features(self, features, patch_h, patch_w):
+    def set_text_cond(self, text_cond):
+        """Legacy external setter for MoE text conditioning.
+
+        The training/eval path now prefers ``forward(..., moe_text_cond_fn=...)``
+        so the condition is generated from the current raw patch tokens inside
+        the same forward pass.
+        """
+        self._text_cond = text_cond
+
+    def enable_rein(self, num_tokens=100, token_rank=16, token_dim=64,
+                    dropout=0.0, adapt_layers=None):
+        """Rein-style in-backbone PEFT (see model/rein_adapter.py).
+
+        The ReinAdapter is registered on the DPT (name 'rein.*') so it lands in
+        the lr*lr_multi param group and is NOT frozen by lock_backbone(). The
+        frozen backbone gets a NON-registered reference (`object.__setattr__`)
+        so the block loop can call it without adding it to backbone.parameters()
+        and so a single deepcopy(model) (the EMA teacher) shares one copy.
+        """
+        from model.rein_adapter import ReinAdapter
+        self.rein = ReinAdapter(
+            self.backbone.embed_dim, self.backbone.n_blocks,
+            num_tokens=num_tokens, token_rank=token_rank, token_dim=token_dim,
+            dropout=dropout, adapt_layers=adapt_layers,
+        )
+        object.__setattr__(self.backbone, '_rein', self.rein)
+        return self.rein
+
+    def adapt_features(self, features, patch_h, patch_w, text_cond=None, edge_cond=None):
         if self.visual_adapter is None:
             return features
+        if getattr(self, '_va_is_moe', False):
+            return self.visual_adapter(features, patch_h, patch_w,
+                                       text_cond=text_cond, edge_cond=edge_cond)
         return self.visual_adapter(features, patch_h, patch_w)
     
     # ── New: split into encode (backbone) + decode (DPT head) ──
@@ -200,7 +246,7 @@ class DPT(nn.Module):
         return out
 
     def forward(self, x, comp_drop=False, return_cls=False, patches_override=None,
-                edge_prior=None):
+                edge_prior=None, moe_text_cond_fn=None):
         """Forward DPT.
 
         If ``patches_override`` is provided (shape [B, N, embed_dim] matching the
@@ -216,7 +262,36 @@ class DPT(nn.Module):
         behavior to the original forward (backward-compatible).
         """
         features, cls_tok, patch_h, patch_w = self.encode(x, return_cls=return_cls)
-        features = self.adapt_features(features, patch_h, patch_w)
+        _moe_text_cond = None
+        if (getattr(self, '_va_is_moe', False)
+                and getattr(self, '_moe_text_cond_dim', 0) > 0
+                and moe_text_cond_fn is not None):
+            _moe_text_cond = moe_text_cond_fn(features[-1], patch_h, patch_w, edge_prior)
+            if _moe_text_cond is not None:
+                expected = int(getattr(self, '_moe_text_cond_dim', 0))
+                if (_moe_text_cond.dim() != 3
+                        or _moe_text_cond.shape[:2] != features[-1].shape[:2]
+                        or _moe_text_cond.shape[-1] != expected):
+                    raise RuntimeError(
+                        "HPTA-MoE text condition must have shape "
+                        f"[B, N, {expected}], got {tuple(_moe_text_cond.shape)}"
+                    )
+        # MoE visual adapter: build the per-token edge signal (self-contained from
+        # the RGB edge prior) so the router coordinates with the edge module; the
+        # text signal is supplied by the LC-PAM branch via moe_text_cond_fn.
+        _moe_edge_cond = None
+        if getattr(self, '_va_is_moe', False) and getattr(self, '_moe_edge_cond_dim', 0) > 0:
+            from util.edge_enhance import edge_to_tokens, rgb_edge_prior
+            _ep = edge_prior.detach() if edge_prior is not None else rgb_edge_prior(x)
+            _et = edge_to_tokens(_ep, patch_h, patch_w)
+            if _et.dim() == 3 and _et.shape[-1] != 1:
+                _et = _et.mean(dim=-1, keepdim=True)
+            _moe_edge_cond = _et
+        features = self.adapt_features(
+            features, patch_h, patch_w,
+            text_cond=(_moe_text_cond if _moe_text_cond is not None
+                       else getattr(self, '_text_cond', None)),
+            edge_cond=_moe_edge_cond)
         # patches BEFORE comp_drop / override, returned to caller for side branch
         clean_patches = features[-1] if return_cls else None
 

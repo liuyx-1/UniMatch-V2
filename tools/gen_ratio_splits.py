@@ -97,9 +97,16 @@ def main():
     test_lines = _read_lines(args.ref / 'test.txt') if (args.ref / 'test.txt').exists() else []
 
     for r in args.ratios:
-        n_lab = max(1, int(round(n_total * r)))
-        lab  = sorted(pool[:n_lab])
-        unl  = sorted(pool[n_lab:])
+        if r >= 1.0:
+            # Full-label / upper-bound split for the *full SSL model*:
+            # every image is labeled AND also used as an unlabeled (consistency)
+            # sample, so LC-PAM / edge / TCR / FixMatch branches still run.
+            lab = sorted(pool)
+            unl = sorted(pool)
+        else:
+            n_lab = max(1, int(round(n_total * r)))
+            lab  = sorted(pool[:n_lab])
+            unl  = sorted(pool[n_lab:])
         rstr = f'{r:.2f}'
         dest = args.out_root / f'unimatch_splits_{args.dataset}_{rstr}_seed{args.seed}'
         dest.mkdir(parents=True, exist_ok=True)

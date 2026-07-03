@@ -9,6 +9,7 @@ import time
 import torch
 from torch import nn
 import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -23,6 +24,7 @@ from util.utils import count_params, init_log, AverageMeter
 from util.dist_helper import setup_distributed
 
 from util.boundary_loss import boundary_loss
+from util.instance_aware_loss import instance_aware_loss
 from util.bias_metrics import compute_train_pixel_freq, split_head_body_tail
 from util.cls_head import (build_cls_head, build_cls_loss,
                              cls_target_from_mask, cls_loss as _bce_cls_loss)
@@ -35,6 +37,10 @@ try:
 except ImportError:
     _entropy_gated_consistency = None
 import torch.distributed as dist
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 
 def _format_seconds(seconds):
@@ -46,11 +52,75 @@ def _format_seconds(seconds):
     return f'{minutes:d}m{seconds:02d}s'
 
 
+def _build_siglip_text_encoder(local_rank,
+                               model_name='google/siglip2-base-patch16-256'):
+    """Frozen SigLIP text callable compatible with TextMorphologyPrior."""
+    from transformers import AutoModel, AutoTokenizer
+
+    device = torch.device('cuda', int(local_rank)) if torch.cuda.is_available() \
+        else torch.device('cpu')
+    text_model = AutoModel.from_pretrained(model_name).text_model.to(device).eval()
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    for p in text_model.parameters():
+        p.requires_grad = False
+
+    @torch.no_grad()
+    def _encode_text(prompts):
+        toks = tokenizer(prompts, return_tensors='pt', padding='max_length',
+                         truncation=True, max_length=64).to(device)
+        out = text_model(**toks)
+        last = out.last_hidden_state
+        attn = toks.get('attention_mask', None)
+        if attn is not None:
+            lens = attn.sum(dim=1) - 1
+            pooled = last[torch.arange(last.size(0), device=device), lens]
+        else:
+            pooled = last[:, -1, :]
+        return F.normalize(pooled.float(), dim=-1).detach().cpu()
+
+    return _encode_text
+
+
 parser = argparse.ArgumentParser(description='UniMatch V2: Pushing the Limit of Semi-Supervised Semantic Segmentation')
 parser.add_argument('--config', type=str, required=True)
 parser.add_argument('--labeled-id-path', type=str, required=True)
 parser.add_argument('--unlabeled-id-path', type=str, required=True)
 parser.add_argument('--val-id-path', type=str, default=None)
+parser.add_argument('--test-id-path', type=str, default=None,
+                    help='optional held-out test split evaluated each epoch; '
+                         'if omitted or missing, the val metrics are reused as test')
+parser.add_argument('--eval-interval', type=int, default=1,
+                    help='run validation/test every N epochs (the final epoch is '
+                         'always evaluated). Raise on large datasets to speed up training.')
+parser.add_argument('--test-interval', type=int, default=0,
+                    help='held-out test split cadence DURING training. '
+                         '-1 = never (fully disabled); 0 = only the final epoch '
+                         '(default — keeps training fast); >0 = every N epochs + final.')
+parser.add_argument('--eval-ema-only', action='store_true', default=False,
+                    help='evaluate ONLY the EMA model during training (skip the raw '
+                         'model eval) and select best.pth by EMA mIoU. Halves the '
+                         'per-epoch validation cost; recommended for large datasets.')
+parser.add_argument('--eval-batch-size', type=int, default=1,
+                    help='batch size for val/test evaluation. >1 greatly speeds up '
+                         'eval but requires all eval images to share one resolution '
+                         '(true for endovis/cholec/endoscapes frames).')
+parser.add_argument('--eval-size', type=int, default=0,
+                    help='cap the longer side of eval inputs to this many pixels '
+                         '(rounded to a patch multiple). 0 = full resolution. '
+                         'Bounds the O(N^2) attention cost of high-res frames '
+                         '(e.g. 686 for endovis 1280x1024). Scoring stays at GT size.')
+parser.add_argument('--exclude-classes', type=int, nargs='*', default=None,
+                    help='classes dropped from present-only means + best-model selection '
+                         '(default: [0]=background for endovis2017_* to match the paper, '
+                         'else none). Reporting/selection only — never affects the loss.')
+parser.add_argument('--supervised-only', dest='supervised_only',
+                    action='store_true', default=False,
+                    help='pure fully-supervised training: NO EMA teacher, NO '
+                         'unlabeled consistency stream, NO TCR/TSMDR. Only the '
+                         'labeled CE + labeled-side aux (LC-PAM cls / edge boundary / '
+                         'cls head). Intended for the RATE=1.0 supervised upper bound '
+                         'of the full architecture. Also skips the per-step EMA copy, '
+                         'so each iteration is ~2-3x cheaper.')
 parser.add_argument('--save-path', type=str, required=True)
 parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
@@ -75,9 +145,14 @@ parser.add_argument('--temporal-original', action='store_true', default=False,
                          'Kept for legacy / ablation reproducibility — '
                          'normally inferior to the default teacher-vs-student form.')
 # ---- TS-MDR (Text-Semantic Morphology Dynamic Router) ----
+# Part of the proposed method (on by default); --no-tsmdr is for ablation only.
 parser.add_argument('--tsmdr-enabled', dest='tsmdr_enabled',
-                    action='store_true', default=False,
-                    help='enable Text-Semantic Morphology Dynamic Router')
+                    action='store_true', default=True,
+                    help='Text-Semantic Morphology Dynamic Router (default ON; '
+                         'kept for backward-compat launch scripts).')
+parser.add_argument('--no-tsmdr', dest='tsmdr_enabled',
+                    action='store_false',
+                    help='disable TS-MDR (ablation only).')
 parser.add_argument('--tsmdr-weight', type=float, default=0.1,
                     help='λ_tsmdr for the TSMDR consistency loss')
 parser.add_argument('--tsmdr-warmup', type=int, default=10,
@@ -91,11 +166,32 @@ parser.add_argument('--tsmdr-use-edge', action='store_true', default=False,
 parser.add_argument('--tsmdr-shape-only', action='store_true', default=False,
                     help='use the pure-geometry ShapeMorphologyRouter '
                          '(NO text encoder, NO class-name dependency)')
+# ---- Routed Consistency (TMRC): unified TCR / TS-MDR path ------------
+parser.add_argument('--routed-consistency', action='store_true', default=False,
+                    help='enable unified routed consistency module; legacy '
+                         'TCR/TS-MDR paths stay unchanged when this is off')
+parser.add_argument('--route', choices=('none', 'shape', 'text'), default='none',
+                    help='routing source for --routed-consistency; none = '
+                         'uniform weights and beta=0 is exact TCR')
+parser.add_argument('--consistency-weight', type=float, default=0.1,
+                    help='lambda for the unified consistency loss')
+parser.add_argument('--consistency-beta', type=float, default=0.0,
+                    help='directional TS-MDR term weight inside routed consistency')
+parser.add_argument('--consistency-warmup', type=int, default=2,
+                    help='epochs to wait before enabling routed consistency')
+parser.add_argument('--consistency-use-edge', action='store_true', default=False,
+                    help='enable edge consistency inside the routed directional term')
 # Stage-1 affinity prior side branch
 parser.add_argument('--affinity-warmstart', type=str, default=None,
                     help='Optional text-affinity warmstart checkpoint. affinity_min can also initialize from dataset class names when --joint-text-stage is set.')
 parser.add_argument('--affinity-aux-weight', type=float, default=0.5,
                     help='Final weight of the image-level cls BCE aux loss from affinity head.')
+parser.add_argument('--affinity-aux-min-pixels', type=int, default=32,
+                    help='min mask pixels for a class to count as present in the '
+                         'image-level affinity BCE target (aligns with cls-head min_pixels).')
+parser.add_argument('--no-match-prior-scale', action='store_true',
+                    help='disable moment-matching the LC-PAM prior to the DPT logit '
+                         'scale before fusion (ablation; default is matched).')
 # ── Backbone freeze policy during segmentation training ────────────────
 # Default (None): when AFFINITY_WARMSTART points to a CMA-trained ckpt, the
 # backbone is AUTO-LOCKED (pure PEFT, matches that checkpoint); otherwise the YAML's
@@ -131,13 +227,52 @@ parser.add_argument('--visual-adapter-reduction', type=int, default=8,
                     help='channel reduction ratio for DinoDPTAdapter')
 parser.add_argument('--visual-adapter-dropout', type=float, default=0.0,
                     help='dropout inside DinoDPTAdapter')
+# HPTA-MoE: 4-expert per-token soft routing (model/visual_adapter_moe.py). The
+# router coordinates with the edge module (self-contained edge signal) and the
+# LC-PAM text branch via DPT.forward(..., moe_text_cond_fn=...) when enabled.
+parser.add_argument('--visual-adapter-moe', action='store_true',
+                    help='use the 4-expert MoE token adapter instead of HOM-lite')
+parser.add_argument('--moe-edge-cond', action='store_true',
+                    help='condition the MoE router on the per-token edge prior')
+parser.add_argument('--moe-text-cond-dim', type=int, default=0,
+                    help='dim of the per-token text signal fed to the MoE router '
+                         '(0 = off; LC-PAM emits this through moe_text_cond_fn)')
+# Rein-style in-backbone PEFT (model/rein_adapter.py). Injects learnable token
+# refinement BETWEEN frozen DINOv2 layers; auto-locks the backbone like
+# --visual-adapter. Can be combined with --visual-adapter or used alone.
+parser.add_argument('--rein', action='store_true',
+                    help='enable Rein-style in-backbone PEFT for the frozen DINOv2')
+parser.add_argument('--rein-tokens', type=int, default=100,
+                    help='number of learnable Rein tokens per adapted layer')
+parser.add_argument('--rein-rank', type=int, default=16,
+                    help='low-rank dim of the shared Rein token basis')
+parser.add_argument('--rein-dim', type=int, default=64,
+                    help='Rein bottleneck (down/up) dimension')
+parser.add_argument('--rein-dropout', type=float, default=0.0,
+                    help='dropout inside Rein refinement')
+parser.add_argument('--rein-layers', type=str, default=None,
+                    help='comma-separated block indices to adapt (default: all)')
+# Per-epoch DELTA checkpoints: with a frozen backbone, only the small trainable
+# part (head + adapter/rein/edge + LC-PAM) changes each epoch. Saving just that
+# (fp16) per epoch is tiny; the frozen backbone is saved ONCE (frozen_base.pth)
+# and re-merged at test time (test.py --delta ...). No-op unless the backbone is
+# locked (PEFT rows); the full-FT base still uses latest.pth/best.pth.
+parser.add_argument('--save-epoch-deltas', action='store_true',
+                    help='save per-epoch trainable-only delta ckpts + one frozen_base.pth')
 # RGB edge prior residual enhancement.
 parser.add_argument('--edge-enhance', dest='edge_enhance', action='store_true', default=None,
-                    help='enable non-shared RGB-edge residual adapters for text latent and DPT features')
+                    help='enable edge prior computation for MGER / HPTA-MoE edge routing')
 parser.add_argument('--no-edge-enhance', dest='edge_enhance', action='store_false',
-                    help='disable RGB-edge residual enhancement')
+                    help='disable edge prior computation')
+parser.add_argument('--edge-residual-adapters', action='store_true', default=False,
+                    help='legacy ablation: additionally enable edge residual adapters '
+                         'on DPT patch features and LC-PAM latents. The main method '
+                         'uses MGER as a detached routing prior for HPTA-MoE instead.')
 parser.add_argument('--edge-boundary-weight', type=float, default=0.05,
                     help='weight for GT/pseudo-mask supervision of the edge boundary head')
+parser.add_argument('--edge-boundary-pos-weight', type=float, default=8.0,
+                    help='BCE positive weight for the seg-side aux boundary head; '
+                         'boundaries are sparse (~5-10%%) so 4-8 prevents collapse')
 parser.add_argument('--edge-consistency-weight', type=float, default=0.01,
                     help='weight for weak consistency between edge boundary head and RGB edge prior')
 parser.add_argument('--edge-warmup', type=int, default=0,
@@ -147,8 +282,7 @@ parser.add_argument('--edge-dropout', type=float, default=0.0,
 parser.add_argument('--edge-refiner', action='store_true', default=False,
                     help='enable Mask-Guided Edge Refiner: a lightweight 2D CNN '
                          'that purifies the raw Sobel edge into a clean '
-                         'semantic-boundary map before it gates DINO/text '
-                         'features. Strongly recommended with --edge-enhance.')
+                         'semantic-boundary map before HPTA-MoE edge routing.')
 parser.add_argument('--edge-refiner-weight', type=float, default=0.1,
                     help='weight for the MGER mask-boundary supervision loss')
 parser.add_argument('--edge-refiner-dropout', type=float, default=0.05)
@@ -161,6 +295,47 @@ parser.add_argument('--edge-refiner-checkpoint', action='store_true',
                     help='gradient-checkpoint the MGER forward on the labeled '
                          'branch; trades ~3%% wallclock for ~250 MB activations. '
                          'Enable when edge+text OOMs at the desired BS.')
+parser.add_argument('--grad-checkpointing', action='store_true',
+                    help='gradient-checkpoint the DINOv2 transformer blocks: large '
+                         'activation-memory savings at the SAME resolution and batch '
+                         'size, ~20-30%% slower forward. Most effective when the backbone '
+                         'is trainable (the default).')
+# Part of the proposed method (on by default, both labeled and unlabeled
+# branches); --no-instance-loss / --no-instance-loss-unlabeled are for
+# ablation only.
+parser.add_argument('--instance-loss', dest='instance_loss', action='store_true',
+                    default=True,
+                    help='instance-aware multi-class loss (Kundu et al. 2026 style): '
+                         'one-vs-rest + 2D connected-component decomposition + uniform '
+                         'class/instance averaging, added on top of the existing '
+                         'per-pixel segmentation loss. Targets long-tail/small-instrument '
+                         'classes (needle, clips, suction, ...). Default ON.')
+parser.add_argument('--no-instance-loss', dest='instance_loss', action='store_false',
+                    help='disable the instance-aware loss entirely (ablation only).')
+parser.add_argument('--instance-loss-weight', type=float, default=0.2,
+                    help='weight w_instance on the additive instance-aware loss term.')
+parser.add_argument('--instance-loss-min-size', type=int, default=16,
+                    help='minimum connected-component size (pixels) to count as an '
+                         'instance; smaller components are dropped as noise.')
+parser.add_argument('--instance-loss-alpha', type=float, default=0.5,
+                    help='CE vs Tversky mix inside the per-instance loss (same '
+                         'convention as CombinedCETversky alpha_weight).')
+parser.add_argument('--instance-loss-tversky-alpha', type=float, default=0.7)
+parser.add_argument('--instance-loss-tversky-beta', type=float, default=0.3)
+parser.add_argument('--instance-loss-unlabeled', dest='instance_loss_unlabeled',
+                    action='store_true', default=True,
+                    help='also apply the instance-aware loss to the unlabeled strong '
+                         'views, using the confidence-gated hard pseudo-label as the '
+                         'target (gated by cfg["conf_thresh"], same threshold as the '
+                         'base pseudo-label loss). Default ON (after --instance-loss-warmup).')
+parser.add_argument('--no-instance-loss-unlabeled', dest='instance_loss_unlabeled',
+                    action='store_false',
+                    help='restrict the instance-aware loss to the labeled branch only '
+                         '(ablation only).')
+parser.add_argument('--instance-loss-warmup', type=int, default=5,
+                    help='epoch at which the unlabeled-branch instance loss switches '
+                         'on (ignored on the labeled branch, which is active from '
+                         'epoch 0). Pseudo-labels are noisiest early in training.')
 parser.add_argument('--ema-decay-cap', type=float, default=0.996,
                     help='EMA decay upper bound (warmup formula '
                          '"min(1-1/(iter+1), cap)"). Default 0.996. '
@@ -172,6 +347,13 @@ parser.add_argument('--backbone', type=str, default=None,
                          'at the matching pretrained weights file.')
 parser.add_argument('--backbone-checkpoint', type=str, default=None,
                     help='override cfg.backbone_checkpoint path; pair with --backbone.')
+parser.add_argument('--init-from', type=str, default=None,
+                    help='warm-start the WHOLE model (DPT + modules + affinity) from a prior '
+                         'checkpoint (e.g. a full-supervised r100 best.pth) at the start of a '
+                         'FRESH run: loads weights strict=False, ALSO seeds the EMA teacher, and '
+                         'does NOT restore optimizer/epoch. Intended for deployment / continual '
+                         'adaptation to new UNLABELED data, NOT the controlled label-ratio '
+                         'benchmark. Ignored when a resumable latest.pth already exists in --save-path.')
 # Hyperparameter overrides
 parser.add_argument('--batch-size', type=int,   default=None)
 parser.add_argument('--lr',         type=float, default=None)
@@ -179,8 +361,58 @@ parser.add_argument('--epochs',     type=int,   default=None)
 parser.add_argument('--crop-size',  type=int,   default=None)
 
 
+from PIL import Image as _PILImage
+
+
+class ResolutionBatchSampler(torch.utils.data.Sampler):
+    """Batch eval indices so every batch holds ONE native resolution.
+
+    Multi-video eval sets mix frame sizes, which makes default collation fail at
+    batch_size>1 ("storage not resizable"). We group indices by native (W,H) and
+    chunk each group into batches, so batched eval works WITHOUT resizing images
+    (the present-only mIoU protocol is unchanged). DDP-aware: each rank takes a
+    disjoint shard with NO padding, so the all_reduce in evaluate() counts every
+    image exactly once (more exact than DistributedSampler's padded eval)."""
+
+    def __init__(self, dataset, batch_size):
+        self.batch_size = max(1, int(batch_size))
+        if dist.is_available() and dist.is_initialized():
+            num_replicas, rank = dist.get_world_size(), dist.get_rank()
+        else:
+            num_replicas, rank = 1, 0
+        # native size per index — PIL reads the header only, not the pixels
+        sizes = []
+        for line in dataset.ids:
+            rel = (line.split('\t') if '\t' in line else line.split(' '))[0]
+            with _PILImage.open(os.path.join(dataset.root, rel)) as im:
+                sizes.append(im.size)                      # (W, H)
+        shard = list(range(len(dataset.ids)))[rank::num_replicas]
+        buckets = {}
+        for i in shard:
+            buckets.setdefault(sizes[i], []).append(i)
+        self.batches = []
+        for _, group in sorted(buckets.items()):
+            for j in range(0, len(group), self.batch_size):
+                self.batches.append(group[j:j + self.batch_size])
+
+    def __iter__(self):
+        return iter(self.batches)
+
+    def __len__(self):
+        return len(self.batches)
+
+
 def main():
     args = parser.parse_args()
+    if getattr(args, 'routed_consistency', False):
+        if float(args.consistency_weight) == 0.1 and float(args.temporal_weight) != 0.1:
+            args.consistency_weight = float(args.temporal_weight)
+        if int(args.consistency_warmup) == 2 and int(args.temporal_warmup) != 2:
+            args.consistency_warmup = int(args.temporal_warmup)
+        if bool(args.tsmdr_use_edge) and not bool(args.consistency_use_edge):
+            args.consistency_use_edge = True
+        if bool(args.tsmdr_shape_only) and str(args.route) == 'none':
+            args.route = 'shape'
     # Anomaly detection ONLY when AFFINITY_DEBUG=1; cheap-ish so 1 epoch is enough to locate
     import os as _os
     if _os.environ.get('AFFINITY_DEBUG', '') == '1':
@@ -200,7 +432,15 @@ def main():
     if args.lr         is not None: cfg['lr']         = float(args.lr)
     if args.epochs     is not None: cfg['epochs']     = int(args.epochs)
     if args.crop_size  is not None: cfg['crop_size']  = int(args.crop_size)
+    # Self-describing save dir: append the run hyper-params so parallel runs
+    # (different bs/lr/epochs/crop) never collide. Idempotent — skipped when the
+    # caller already embedded an explicit '_bs' suffix, so --resume stays valid.
+    if '_bs' not in os.path.basename(args.save_path):
+        _lrtag = ('%g' % float(cfg['lr'])).replace('+', '')
+        args.save_path = (f"{args.save_path}_bs{int(cfg['batch_size'])}"
+                          f"_lr{_lrtag}_ep{int(cfg['epochs'])}_cr{int(cfg['crop_size'])}")
     use_edge_enhance = bool(args.edge_enhance)
+    use_edge_residual_adapters = bool(getattr(args, 'edge_residual_adapters', False))
     # static_graph (forced True when use_edge_enhance) cannot tolerate a
     # warmup-induced topology change in the loss graph. Fail fast.
     if use_edge_enhance and bool(getattr(args, 'edge_refiner', False)) \
@@ -210,6 +450,7 @@ def main():
             f"requires constant backward graph; got edge_warmup="
             f"{int(args.edge_warmup)}).")
     use_visual_adapter = bool(args.visual_adapter)
+    use_rein = bool(args.rein)
 
     # ── Peek affinity ckpt ONCE: drives both static_graph and lock_backbone ──
     _aff_metric_in_ckpt = None
@@ -227,9 +468,10 @@ def main():
     if args.lock_backbone_stage2 is not None:
         cfg['lock_backbone'] = bool(args.lock_backbone_stage2)
         _lock_reason = f'CLI --{"" if args.lock_backbone_stage2 else "no-"}lock-backbone-stage2'
-    elif use_visual_adapter:
+    elif use_visual_adapter or use_rein:
         cfg['lock_backbone'] = True
-        _lock_reason = 'auto: --visual-adapter uses frozen-DINO PEFT protocol'
+        _lock_reason = ('auto: --rein uses frozen-DINO PEFT protocol' if use_rein
+                        else 'auto: --visual-adapter uses frozen-DINO PEFT protocol')
     elif _aff_metric_in_ckpt == 'cma':
         cfg['lock_backbone'] = True
         _lock_reason = 'auto: CMA ckpt detected (pure PEFT protocol)'
@@ -254,6 +496,9 @@ def main():
 
     cudnn.enabled = True
     cudnn.benchmark = True
+    # TF32 matmul/conv: large free speedup on Ampere+ (A100/RTX30+), no-op on Volta.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     model_configs = {
         'small': {'encoder_size': 'small', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -274,6 +519,11 @@ def main():
     if isinstance(state_dict, dict) and 'model' in state_dict:
         state_dict = state_dict['model']
     model.backbone.load_state_dict(state_dict)
+    if getattr(args, 'grad_checkpointing', False):
+        model.backbone.set_grad_checkpointing(True)
+        if rank == 0:
+            logger.info('[mem] DINOv2 gradient checkpointing ENABLED '
+                        '(lower activation VRAM, ~20-30%% slower forward)')
     # If a legacy affinity checkpoint trained the visual backbone, prefer its weights as a warm-start.
     # NOTE: model_ema is built via deepcopy(model) AFTER this block, so the
     # EMA teacher automatically inherits those backbone weights too.
@@ -296,38 +546,81 @@ def main():
                                 % (args.affinity_warmstart, e))
         
     if use_visual_adapter:
+        _moe = bool(args.visual_adapter_moe)
         model.enable_visual_adapter(
             reduction=int(args.visual_adapter_reduction),
             dropout=float(args.visual_adapter_dropout),
+            moe=_moe,
+            moe_edge_cond=bool(args.moe_edge_cond),
+            moe_text_cond_dim=int(args.moe_text_cond_dim),
         )
         if rank == 0:
-            logger.info('[visual-adapter] enabled  type=DinoDPTAdapter-HOM-lite  '
-                        'reduction=%d  dropout=%.3f'
-                        % (int(args.visual_adapter_reduction),
-                           float(args.visual_adapter_dropout)))
+            logger.info('[visual-adapter] enabled  type=%s  reduction=%d  dropout=%.3f'
+                        '%s'
+                        % ('MoE-4expert' if _moe else 'DinoDPTAdapter-HOM-lite',
+                           int(args.visual_adapter_reduction),
+                           float(args.visual_adapter_dropout),
+                           ('  edge_cond=%s  text_cond_dim=%d'
+                            % (bool(args.moe_edge_cond), int(args.moe_text_cond_dim)))
+                           if _moe else ''))
+
+    if use_rein:
+        _rein_layers = (None if not args.rein_layers
+                        else [int(s) for s in str(args.rein_layers).split(',') if s.strip() != ''])
+        _rein_mod = model.enable_rein(
+            num_tokens=int(args.rein_tokens), token_rank=int(args.rein_rank),
+            token_dim=int(args.rein_dim), dropout=float(args.rein_dropout),
+            adapt_layers=_rein_layers,
+        )
+        if rank == 0:
+            _np = sum(p.numel() for p in _rein_mod.parameters()) / 1e6
+            logger.info('[rein] enabled  layers=%s  tokens=%d  rank=%d  dim=%d  '
+                        'params=%.2fM (trainable PEFT)'
+                        % (str(_rein_mod.adapt_layers), int(args.rein_tokens),
+                           int(args.rein_rank), int(args.rein_dim), _np))
 
     if cfg['lock_backbone']:
         model.lock_backbone()
     if use_edge_enhance:
-        model.edge_seg_adapter = EdgeSegResidualAdapter(
-            model.backbone.embed_dim, dropout=float(args.edge_dropout))
+        if use_edge_residual_adapters:
+            model.edge_seg_adapter = EdgeSegResidualAdapter(
+                model.backbone.embed_dim, dropout=float(args.edge_dropout))
         if bool(args.edge_refiner):
             model.edge_refiner = MaskGuidedEdgeRefiner(
                 mid=16, dropout=float(args.edge_refiner_dropout))
         if rank == 0:
-            logger.info('[edge] enabled  boundary_w=%.4f  consistency_w=%.4f  '
-                        'refiner=%s  refiner_w=%.4f  warmup=%d'
-                        % (float(args.edge_boundary_weight),
+            logger.info('[edge] enabled  residual_adapters=%s  boundary_w=%.4f  '
+                        'consistency_w=%.4f  refiner=%s  refiner_w=%.4f  warmup=%d'
+                        '  role=%s'
+                        % (bool(use_edge_residual_adapters),
+                           float(args.edge_boundary_weight),
                            float(args.edge_consistency_weight),
                            bool(args.edge_refiner),
                            float(args.edge_refiner_weight),
-                           int(args.edge_warmup)))
+                           int(args.edge_warmup),
+                           'MGER-prior-for-HPTA-MoE' if not use_edge_residual_adapters
+                           else 'legacy-residual-adapters'))
     
+    # ---- per-epoch delta checkpoints: save the frozen backbone ONCE ----
+    save_deltas = bool(getattr(args, 'save_epoch_deltas', False)) and cfg['lock_backbone']
+    if getattr(args, 'save_epoch_deltas', False) and not cfg['lock_backbone'] and rank == 0:
+        logger.info('[delta] --save-epoch-deltas ignored: backbone is NOT frozen '
+                    '(full fine-tune); using normal latest.pth/best.pth.')
+    if save_deltas and rank == 0:
+        os.makedirs(os.path.join(args.save_path, 'deltas'), exist_ok=True)
+        _fb = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+               if k.startswith('backbone.')}
+        torch.save({'backbone': _fb, 'backbone_name': cfg.get('backbone')},
+                   os.path.join(args.save_path, 'frozen_base.pth'))
+        logger.info('[delta] frozen backbone saved (%d tensors) -> frozen_base.pth; '
+                    'per-epoch deltas -> deltas/epNNN.pth (fp16, non-backbone only)'
+                    % len(_fb))
+
     optimizer = AdamW(
         [
             {'params': [p for p in model.backbone.parameters() if p.requires_grad], 'lr': cfg['lr']},
             {'params': [param for name, param in model.named_parameters() if 'backbone' not in name], 'lr': cfg['lr'] * cfg['lr_multi']}
-        ], 
+        ],
         lr=cfg['lr'], betas=(0.9, 0.999), weight_decay=0.01
     )
     
@@ -340,7 +633,10 @@ def main():
         logger.info('Trainable params: {:.1f}M\n'.format(trainable_params))
     
     local_rank = int(os.environ["LOCAL_RANK"])
-    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    # SyncBatchNorm only helps with >1 GPU; on a single GPU it adds an all_reduce
+    # per BN forward (the DPT head has BatchNorm) for zero benefit — skip it.
+    if world_size > 1:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda()
 
     # static_graph=True is required when a sub-module's parameters are touched
@@ -371,9 +667,49 @@ def main():
     for param in model_ema.parameters():
         param.requires_grad = False
 
+    routed_pack = None
+    if getattr(args, 'routed_consistency', False):
+        try:
+            from util.classes import CLASSES as _CLS
+            from util.routed_consistency import RoutedConsistencyLoss
+            _route = str(getattr(args, 'route', 'none')).lower()
+            _class_names = _CLS[cfg['dataset']]
+            _encode_text = (_build_siglip_text_encoder(local_rank)
+                            if _route == 'text' else None)
+            _routed = RoutedConsistencyLoss(
+                num_classes=cfg['nclass'],
+                route=_route,
+                class_names=_class_names if _route == 'text' else None,
+                encode_text=_encode_text,
+                radius=int(getattr(args, 'tsmdr_radius', 3)),
+                use_edge=bool(getattr(args, 'consistency_use_edge', False)),
+                lambda_temp_base=0.1,
+                lambda_edge_base=0.1,
+            ).cuda(local_rank)
+            _routed_params = [p for p in _routed.parameters() if p.requires_grad]
+            if _routed_params:
+                optimizer.add_param_group({
+                    'params': _routed_params,
+                    'lr': cfg['lr'] * cfg['lr_multi'],
+                })
+            routed_pack = dict(loss=_routed)
+            if rank == 0:
+                _n_train = sum(p.numel() for p in _routed_params)
+                logger.info('[routed_consistency] enabled  route=%s  lambda=%.3f  '
+                            'beta=%.3f  warmup=%d  use_edge=%s  trainable_params=%d',
+                            _route, float(args.consistency_weight),
+                            float(args.consistency_beta),
+                            int(args.consistency_warmup),
+                            bool(args.consistency_use_edge), _n_train)
+        except Exception as _e:
+            if rank == 0:
+                logger.exception('[routed_consistency] init failed; aborting to avoid '
+                                 'silently dropping the consistency loss')
+            raise
+
     # ---- TS-MDR init (once, before the training loop) -----------------
     tsmdr_pack = None
-    if getattr(args, 'tsmdr_enabled', False):
+    if getattr(args, 'tsmdr_enabled', False) and not getattr(args, 'routed_consistency', False):
         try:
             from util.classes import CLASSES as _CLS
             from util.temporal_tsmdr import (
@@ -439,22 +775,49 @@ def main():
     valset = SemiDataset(
         cfg['dataset'], cfg['data_root'], 'val', id_path=args.val_id_path
     )
-    
+    # Optional held-out test split, evaluated each epoch alongside val.
+    # Reuse val numbers as "test" when no distinct test split is available.
+    testset = None
+    # realpath so a test.txt symlinked to val.txt (cholecseg8k / endovis2017)
+    # is recognised as the same split and not evaluated twice.
+    if args.test_id_path and os.path.isfile(args.test_id_path) \
+            and os.path.realpath(args.test_id_path) != os.path.realpath(args.val_id_path or ''):
+        testset = SemiDataset(
+            cfg['dataset'], cfg['data_root'], 'val', id_path=args.test_id_path
+        )
+
+    # persistent_workers keeps the (heavy CutMix/aug) worker pool alive across
+    # epochs instead of re-spawning it every epoch; prefetch_factor hides IO.
+    _nw = int(os.environ.get('NUM_WORKERS', 8))
     trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
     trainloader_l = DataLoader(
-        trainset_l, batch_size=cfg['batch_size'], pin_memory=True, num_workers=4, drop_last=True, sampler=trainsampler_l
+        trainset_l, batch_size=cfg['batch_size'], pin_memory=True, num_workers=_nw,
+        drop_last=True, sampler=trainsampler_l,
+        persistent_workers=(_nw > 0), prefetch_factor=(4 if _nw > 0 else None)
     )
-    
+
     trainsampler_u = torch.utils.data.distributed.DistributedSampler(trainset_u)
     trainloader_u = DataLoader(
-        trainset_u, batch_size=cfg['batch_size'], pin_memory=True, num_workers=4, drop_last=True, sampler=trainsampler_u
+        trainset_u, batch_size=cfg['batch_size'], pin_memory=True, num_workers=_nw,
+        drop_last=True, sampler=trainsampler_u,
+        persistent_workers=(_nw > 0), prefetch_factor=(4 if _nw > 0 else None)
     )
     
-    valsampler = torch.utils.data.distributed.DistributedSampler(valset)
+    eval_bs = max(1, int(args.eval_batch_size))
+    # resolution-bucketed batching: same-size frames share a batch, so eval-bs>1
+    # is safe on multi-video sets without resizing (metric unchanged).
     valloader = DataLoader(
-        valset, batch_size=1, pin_memory=True, num_workers=1, drop_last=False, sampler=valsampler
+        valset, batch_sampler=ResolutionBatchSampler(valset, eval_bs),
+        pin_memory=True, num_workers=4
     )
-    
+
+    testloader = None
+    if testset is not None:
+        testloader = DataLoader(
+            testset, batch_sampler=ResolutionBatchSampler(testset, eval_bs),
+            pin_memory=True, num_workers=4
+        )
+
     # --- Cls aux head (image-level multi-label, on backbone CLS token) ---
     cls_cfg = cfg.get('cls') or {}
     use_cls = bool(cls_cfg.get('enabled', False))
@@ -502,8 +865,9 @@ def main():
             n_orig_classes=cfg['nclass'],
             class_names=CLASSES[cfg['dataset']],
             dataset=cfg['dataset'],
+            match_prior_scale=not bool(getattr(args, 'no_match_prior_scale', False)),
         )
-        if use_edge_enhance:
+        if use_edge_enhance and use_edge_residual_adapters:
             affinity_side.enable_edge_enhance(dropout=float(args.edge_dropout))
         affinity_side = affinity_side.cuda(local_rank)
         # static_graph=True lets DDP tolerate parameters being touched
@@ -530,12 +894,10 @@ def main():
         affinity_side_ema.eval()
         for p in affinity_side_ema.parameters():
             p.requires_grad = False
-    else:
-        affinity_side_ema = None
         # gate_conv is always trainable — add to optimizer immediately
         optimizer.add_param_group({'params': affinity_side.module.gate_conv.parameters(),
                                      'lr': cfg['lr'] * cfg['lr_multi']})
-        if use_edge_enhance:
+        if use_edge_enhance and use_edge_residual_adapters:
             optimizer.add_param_group({'params': affinity_side.module.edge_parameters(),
                                          'lr': cfg['lr'] * cfg['lr_multi']})
         if args.joint_text_stage:
@@ -557,12 +919,81 @@ def main():
                     float(args.affinity_aux_weight),
                     int(args.affinity_aux_warmup),
                     bool(args.joint_text_stage)))
+    else:
+        affinity_side_ema = None
+
+    def _moe_text_cond_active():
+        mod = model.module if hasattr(model, 'module') else model
+        return (affinity_side is not None
+                and getattr(mod, '_va_is_moe', False)
+                and int(getattr(mod, '_moe_text_cond_dim', 0)) > 0)
+
+    def _moe_text_cond_fn(patches, patch_h, patch_w, edge_prior):
+        """LC-PAM -> HPTA-MoE conditioning path.
+
+        The signal is read from the current LC-PAM branch under no_grad so the
+        main DDP model still owns the segmentation backward graph. LC-PAM itself
+        is trained by its normal dense-prior fusion and aux BCE losses below.
+        """
+        if not _moe_text_cond_active():
+            return None
+        with torch.no_grad():
+            cond = affinity_side.module.moe_text_condition(
+                patches.detach(), patch_hw=(patch_h, patch_w),
+                edge_prior=edge_prior)
+        expected = int((model.module if hasattr(model, 'module') else model)._moe_text_cond_dim)
+        if cond.shape[-1] != expected:
+            raise RuntimeError(
+                f"MOE_TEXT_COND_DIM={expected} but LC-PAM emits "
+                f"{cond.shape[-1]} dims. Set MOE_TEXT_COND_DIM={cond.shape[-1]} "
+                "or add an explicit projection."
+            )
+        return cond
+
+    def _adapt_with_moe_text(mod, features, patch_h, patch_w, edge_prior):
+        text_cond = None
+        if _moe_text_cond_active():
+            text_cond = _moe_text_cond_fn(features[-1], patch_h, patch_w, edge_prior)
+        edge_cond = None
+        if getattr(mod, '_va_is_moe', False) and getattr(mod, '_moe_edge_cond_dim', 0) > 0:
+            _ep = edge_prior.detach() if edge_prior is not None else None
+            if _ep is None:
+                # Re-decode paths do not have the input tensor here. In normal
+                # training with edge-conditioned MoE the caller already passes
+                # edge_prior, so falling back to no edge condition is safer than
+                # recomputing from an unavailable image.
+                edge_cond = None
+            else:
+                _et = edge_to_tokens(_ep, patch_h, patch_w)
+                if _et.dim() == 3 and _et.shape[-1] != 1:
+                    _et = _et.mean(dim=-1, keepdim=True)
+                edge_cond = _et
+        return mod.adapt_features(features, patch_h, patch_w,
+                                  text_cond=text_cond, edge_cond=edge_cond)
 
     total_iters = len(trainloader_u) * cfg['epochs']
     previous_best, previous_best_ema = 0.0, 0.0
     best_epoch, best_epoch_ema = 0, 0
     epoch = -1
     epoch_time = AverageMeter()
+
+    # present-only reporting/selection: drop absent classes; endovis2017_* also
+    # drops background (cls 0) to match the paper's 7-instrument mIoU. Metrics
+    # never enter the loss; previous_best now tracks present-only val mIoU.
+    if args.exclude_classes is None:
+        exclude_classes = [0] if str(cfg['dataset']).startswith('endovis2017') else []
+    else:
+        exclude_classes = list(args.exclude_classes)
+    if rank == 0:
+        logger.info('present-only means exclude classes: %s', exclude_classes or 'none')
+
+    if rank == 0 and getattr(args, 'instance_loss', False):
+        _inst_class_ids = [c for c in range(cfg['nclass']) if c not in exclude_classes]
+        logger.info('[instance-loss] enabled  classes=%s  weight=%.3f  min_size=%d  '
+                    'unlabeled=%s  warmup=%d ep',
+                    _inst_class_ids, args.instance_loss_weight,
+                    args.instance_loss_min_size,
+                    bool(args.instance_loss_unlabeled), args.instance_loss_warmup)
 
     hbt_split = {'head': [], 'body': [], 'tail': []}
     if rank == 0:
@@ -578,6 +1009,21 @@ def main():
         except Exception as e:
             logger.warning('[bias-log] failed to derive H/B/T split: %s' % e)
     
+    if getattr(args, 'init_from', None) \
+            and not os.path.exists(os.path.join(args.save_path, 'latest.pth')):
+        init_ck = torch.load(args.init_from, map_location='cpu')
+        init_sd = init_ck['model'] if (isinstance(init_ck, dict) and 'model' in init_ck) else init_ck
+        msg = model.load_state_dict(init_sd, strict=False)
+        model_ema.load_state_dict(init_sd, strict=False)          # seed teacher from the same strong init
+        if affinity_side is not None and isinstance(init_ck, dict) and 'affinity_side' in init_ck:
+            affinity_side.module.load_state_dict_from_save(init_ck['affinity_side'])
+            if affinity_side_ema is not None:
+                affinity_side_ema.module.load_state_dict_from_save(init_ck['affinity_side'])
+        if rank == 0:
+            logger.info('[init-from] warm-started model+EMA from %s (missing=%d unexpected=%d); '
+                        'optimizer/epoch NOT restored -> fresh run for deployment/adaptation'
+                        % (args.init_from, len(msg.missing_keys), len(msg.unexpected_keys)))
+
     if os.path.exists(os.path.join(args.save_path, 'latest.pth')):
         checkpoint = torch.load(os.path.join(args.save_path, 'latest.pth'), map_location='cpu')
         if use_edge_enhance:
@@ -640,6 +1086,7 @@ def main():
         total_loss_aff = AverageMeter()
         total_loss_edge = AverageMeter()
         total_loss_tcr  = AverageMeter()
+        total_loss_inst = AverageMeter()
         total_gate     = AverageMeter()
         total_mask_ratio = AverageMeter()
         counter_device = torch.device('cuda', local_rank)
@@ -650,7 +1097,14 @@ def main():
         trainloader_u.sampler.set_epoch(epoch)
 
         loader = zip(trainloader_l, trainloader_u)
-        
+        # Progress bar on rank 0 only (avoids duplicate bars under DDP). Falls
+        # back to the plain iterator if tqdm is unavailable.
+        n_iters_epoch = len(trainloader_u)
+        if rank == 0 and tqdm is not None:
+            loader = tqdm(loader, total=n_iters_epoch,
+                          desc='Epoch %d/%d' % (epoch + 1, cfg['epochs']),
+                          dynamic_ncols=True, leave=True, mininterval=1.0)
+
         model.train()
 
         for i, ((img_x, mask_x),
@@ -706,22 +1160,26 @@ def main():
             need_patches = (use_cls or affinity_side is not None)
             if need_patches:
                 pred_x, cls_tok_x, patches_x = model(img_x, return_cls=True,
-                                                       edge_prior=edge_x)
+                                                       edge_prior=edge_x,
+                                                       moe_text_cond_fn=_moe_text_cond_fn)
             else:
-                pred_x = model(img_x, edge_prior=edge_x)
+                pred_x = model(img_x, edge_prior=edge_x,
+                               moe_text_cond_fn=_moe_text_cond_fn)
             edge_boundary_x = getattr(model.module, 'last_edge_boundary_logits', None) if use_edge_enhance else None
 
             if need_patches:
                 edge_u_cat = torch.cat((edge_u_s1, edge_u_s2)) if use_edge_enhance else None
                 pred_u, _, patches_u = model(torch.cat((img_u_s1, img_u_s2)),
                                               comp_drop=True, return_cls=True,
-                                              edge_prior=edge_u_cat)
+                                              edge_prior=edge_u_cat,
+                                              moe_text_cond_fn=_moe_text_cond_fn)
                 pred_u_s1, pred_u_s2 = pred_u.chunk(2)
                 patches_u1, patches_u2 = patches_u.chunk(2)
             else:
                 edge_u_cat = torch.cat((edge_u_s1, edge_u_s2)) if use_edge_enhance else None
                 pred_u_s1, pred_u_s2 = model(torch.cat((img_u_s1, img_u_s2)),
-                                              comp_drop=True, edge_prior=edge_u_cat).chunk(2)
+                                              comp_drop=True, edge_prior=edge_u_cat,
+                                              moe_text_cond_fn=_moe_text_cond_fn).chunk(2)
             edge_boundary_u = getattr(model.module, 'last_edge_boundary_logits', None) if use_edge_enhance else None
             if edge_boundary_u is not None:
                 edge_boundary_u1, edge_boundary_u2 = edge_boundary_u.chunk(2)
@@ -759,7 +1217,7 @@ def main():
                         # call is the same cost as before but we *avoid* a second
                         # comp_drop'd DPT head + bilinear. Trade-off is acceptable.
                         feats_x, _, _, _ = mod.encode(img_x, return_cls=False)
-                        feats_x = list(mod.adapt_features(feats_x, ph_x, pw_x))
+                        feats_x = list(_adapt_with_moe_text(mod, feats_x, ph_x, pw_x, edge_x))
                         feats_x[-1] = x_aware
                         pred_x = mod.decode(feats_x, ph_x, pw_x, comp_drop=False)
                 pred_x = affinity_side.module.fuse(pred_x, side_x)
@@ -782,7 +1240,7 @@ def main():
                             x_aware_cat, edge_to_tokens(edge_u_cat, ph_u, pw_u), ph_u, pw_u)
                         edge_boundary_u1, edge_boundary_u2 = edge_boundary_u.chunk(2)
                     feats_u, _, _, _ = mod.encode(img_u_cat, return_cls=False)
-                    feats_u = list(mod.adapt_features(feats_u, ph_u, pw_u))
+                    feats_u = list(_adapt_with_moe_text(mod, feats_u, ph_u, pw_u, edge_u_cat))
                     feats_u[-1] = x_aware_cat
                     pred_u = mod.decode(feats_u, ph_u, pw_u, comp_drop=True)
                     pred_u_s1, pred_u_s2 = pred_u.chunk(2)
@@ -817,6 +1275,49 @@ def main():
             loss = (loss_x + loss_u_s) / 2.0
 
             # ------------------------------------------------------------
+            # Instance-Aware Multi-Class Loss (Kundu et al. 2026 style).
+            # Part of the proposed method (default ON, both branches).
+            # One-vs-rest + 2D connected-component decomposition, uniform
+            # class/instance averaging. Additive on top of the existing
+            # per-pixel loss (does not replace criterion_l/criterion_u),
+            # targeting long-tail / small-instrument classes.
+            # Labeled branch: uses clean GT, active from epoch 0.
+            # Unlabeled branch (--no-instance-loss-unlabeled to disable): uses
+            # the SAME confidence-gated hard pseudo-label as the base
+            # pseudo-label loss (cfg['conf_thresh']), plus a min-component-
+            # size filter, and only switches on after --instance-loss-warmup
+            # epochs, since pseudo-labels are noisiest early in training.
+            # ------------------------------------------------------------
+            loss_inst = torch.zeros((), device=loss.device)
+            if getattr(args, 'instance_loss', False):
+                inst_class_ids = [c for c in range(cfg['nclass']) if c not in exclude_classes]
+                loss_inst_x = instance_aware_loss(
+                    pred_x, mask_x, inst_class_ids, ignore_index=255,
+                    min_component_size=int(args.instance_loss_min_size),
+                    tversky_alpha=float(args.instance_loss_tversky_alpha),
+                    tversky_beta=float(args.instance_loss_tversky_beta),
+                    alpha_weight=float(args.instance_loss_alpha))
+                loss_inst = loss_inst_x
+                if bool(getattr(args, 'instance_loss_unlabeled', False)) \
+                        and epoch >= int(getattr(args, 'instance_loss_warmup', 5)):
+                    loss_inst_u1 = instance_aware_loss(
+                        pred_u_s1, mask_u_w_cutmixed1, inst_class_ids, ignore_index=255,
+                        confidence=conf_u_w_cutmixed1, conf_thresh=cfg['conf_thresh'],
+                        min_component_size=int(args.instance_loss_min_size),
+                        tversky_alpha=float(args.instance_loss_tversky_alpha),
+                        tversky_beta=float(args.instance_loss_tversky_beta),
+                        alpha_weight=float(args.instance_loss_alpha))
+                    loss_inst_u2 = instance_aware_loss(
+                        pred_u_s2, mask_u_w_cutmixed2, inst_class_ids, ignore_index=255,
+                        confidence=conf_u_w_cutmixed2, conf_thresh=cfg['conf_thresh'],
+                        min_component_size=int(args.instance_loss_min_size),
+                        tversky_alpha=float(args.instance_loss_tversky_alpha),
+                        tversky_beta=float(args.instance_loss_tversky_beta),
+                        alpha_weight=float(args.instance_loss_alpha))
+                    loss_inst = loss_inst + 0.5 * (loss_inst_u1 + loss_inst_u2)
+                loss = loss + float(args.instance_loss_weight) * loss_inst
+
+            # ------------------------------------------------------------
             # Temporal Consistency Regularization (DA-VSN style).
             #
             # CORRECTED FORMULATION (v2):
@@ -835,6 +1336,7 @@ def main():
             # ------------------------------------------------------------
             loss_tcr = torch.zeros((), device=loss.device)
             if getattr(args, 'temporal_consistency', False) \
+                    and not getattr(args, 'routed_consistency', False) \
                     and epoch >= int(getattr(args, 'temporal_warmup', 2)) \
                     and _entropy_gated_consistency is not None:
                 # ---- v1 (original symmetric s1↔s2, no CutMix alignment) ----
@@ -845,8 +1347,6 @@ def main():
                     loss_tcr_b = _entropy_gated_consistency(p_u_s2, p_u_s1)
                     loss_tcr = 0.5 * (loss_tcr_a + loss_tcr_b)
                     loss = loss + float(getattr(args, 'temporal_weight', 0.1)) * loss_tcr
-                    continue_with_tsmdr = True  # placeholder; original path falls through
-                    if False: pass   # short-circuit the v2 block below
                 # ---- v2 (fixed: teacher weak vs student strong) ----
                 elif True:   # branch kept for indentation parity
                     # 1) teacher's weak-view soft probability (already detached
@@ -889,6 +1389,7 @@ def main():
             # ------------------------------------------------------------
             loss_tsmdr = torch.zeros((), device=loss.device)
             if getattr(args, 'tsmdr_enabled', False) \
+                    and not getattr(args, 'routed_consistency', False) \
                     and epoch >= int(getattr(args, 'tsmdr_warmup', 10)) \
                     and tsmdr_pack is not None:
                 _txt, _ext, _router, _tsmdr_loss = (
@@ -924,6 +1425,39 @@ def main():
                 loss = loss + 0.5 * float(args.tsmdr_weight) * loss_tsmdr
                 loss = loss + float(args.tsmdr_route_ent) * route.get(
                     'loss_route_ent', torch.zeros((), device=loss.device))
+
+            # ------------------------------------------------------------
+            # Routed Consistency (TMRC): unified TCR/TS-MDR path.
+            # route=none,beta=0 delegates to the exact TCR computation above.
+            # ------------------------------------------------------------
+            loss_routed = torch.zeros((), device=loss.device)
+            if getattr(args, 'routed_consistency', False) \
+                    and epoch >= int(getattr(args, 'consistency_warmup', 2)) \
+                    and routed_pack is not None:
+                prob_u_w = pred_u_w.softmax(dim=1)
+                prob_u_w_cm1 = prob_u_w.clone()
+                prob_u_w_cm2 = prob_u_w.clone()
+                em1 = cutmix_box1.unsqueeze(1).expand_as(prob_u_w) == 1
+                em2 = cutmix_box2.unsqueeze(1).expand_as(prob_u_w) == 1
+                prob_u_w_cm1[em1] = prob_u_w.flip(0)[em1]
+                prob_u_w_cm2[em2] = prob_u_w.flip(0)[em2]
+
+                valid1 = (ignore_mask_cutmixed1 != 255).float()
+                valid2 = (ignore_mask_cutmixed2 != 255).float()
+                p_u_s1 = pred_u_s1.softmax(dim=1)
+                p_u_s2 = pred_u_s2.softmax(dim=1)
+
+                _routed_loss = routed_pack['loss']
+                _route_beta = max(0.3, 0.8 - 0.5 * epoch / cfg['epochs'])
+                routed_out = _routed_loss(
+                    p_u_s1, p_u_s2,
+                    prob_u_w_cm1, prob_u_w_cm2,
+                    valid1, valid2,
+                    beta=float(args.consistency_beta),
+                    route_epoch_beta=_route_beta)
+                loss_tcr = routed_out['loss_tcr']
+                loss_routed = routed_out['loss_total']
+                loss = loss + 0.5 * float(args.consistency_weight) * loss_routed
 
             loss_c = torch.zeros((), device=loss.device)
             if use_cls and epoch >= cls_warmup:
@@ -963,7 +1497,8 @@ def main():
                         if new_id < 0: continue
                         # any image where mask == c_orig in significant area
                         # vectorised: True if sum(mask==c_orig) > min_pix
-                        present = ((mask_x == c_orig).flatten(1).sum(dim=1) >= 16)
+                        present = ((mask_x == c_orig).flatten(1).sum(dim=1)
+                                   >= max(1, int(args.affinity_aux_min_pixels)))
                         y_multi[:, new_id] = present.float()
                     loss_aff_cls = nn.functional.binary_cross_entropy_with_logits(
                         affinity_cls_logits_x, y_multi)
@@ -973,20 +1508,22 @@ def main():
             valid_u2  = (conf_u_w_cutmixed2 >= cfg['conf_thresh']) & (ignore_mask_cutmixed2 != 255)
 
             loss_edge = torch.zeros((), device=loss.device)
-            if (use_edge_enhance and epoch >= int(args.edge_warmup)
+            if (use_edge_enhance and use_edge_residual_adapters
+                    and epoch >= int(args.edge_warmup)
                     and edge_boundary_x is not None):
+                edge_bnd_pw = float(args.edge_boundary_pos_weight)
                 edge_mask_loss_x = boundary_loss(
                     edge_boundary_x, mask_x, cfg['nclass'],
-                    pos_weight=1.0, dice_weight=0.5)
+                    pos_weight=edge_bnd_pw, dice_weight=0.5)
                 edge_mask_loss_u1 = boundary_loss(
                     edge_boundary_u1, mask_u_w_cutmixed1, cfg['nclass'],
-                    pos_weight=1.0, valid_mask=valid_u1,
+                    pos_weight=edge_bnd_pw, valid_mask=valid_u1,
                     cutmix_box=cutmix_box1,
                     cutmix_edge_thickness=boundary_seam_thick,
                     dice_weight=0.5) if edge_boundary_u1 is not None else torch.zeros_like(loss)
                 edge_mask_loss_u2 = boundary_loss(
                     edge_boundary_u2, mask_u_w_cutmixed2, cfg['nclass'],
-                    pos_weight=1.0, valid_mask=valid_u2,
+                    pos_weight=edge_bnd_pw, valid_mask=valid_u2,
                     cutmix_box=cutmix_box2,
                     cutmix_edge_thickness=boundary_seam_thick,
                     dice_weight=0.5) if edge_boundary_u2 is not None else torch.zeros_like(loss)
@@ -1000,19 +1537,21 @@ def main():
                 edge_cons = (edge_cons_x + (edge_cons_u1 + edge_cons_u2) / 2.0) / 2.0
                 loss_edge = (float(args.edge_boundary_weight) * edge_mask_loss
                              + float(args.edge_consistency_weight) * edge_cons)
-                # ---- MGER mask-boundary supervision (only when refiner is on)
-                if bool(args.edge_refiner) and edge_x is not None and edge_x.requires_grad:
-                    # MGER is supervised ONLY on the labeled branch: pseudo
-                    # boundaries are too noisy to train an edge refiner with,
-                    # and adding the u branch doubles memory for marginal
-                    # gain.  The refiner still inferences on u_s1/u_s2 in
-                    # no_grad mode so gating quality there is unchanged.
-                    loss_refiner = refined_edge_loss(
-                        edge_x, mask_x, cfg['nclass'],
-                        thickness=int(args.edge_refiner_thickness),
-                        pos_weight=float(args.edge_refiner_pos_weight),
-                        dice_weight=0.5)
-                    loss_edge = loss_edge + float(args.edge_refiner_weight) * loss_refiner
+
+            # ---- MGER mask-boundary supervision (main edge path).
+            # MGER is supervised only on the labeled branch; its refined edge
+            # map is then consumed as a detached prior by HPTA-MoE edge routing.
+            if (use_edge_enhance and epoch >= int(args.edge_warmup)
+                    and bool(args.edge_refiner)
+                    and edge_x is not None and edge_x.requires_grad):
+                loss_refiner = refined_edge_loss(
+                    edge_x, mask_x, cfg['nclass'],
+                    thickness=int(args.edge_refiner_thickness),
+                    pos_weight=float(args.edge_refiner_pos_weight),
+                    dice_weight=0.5)
+                loss_edge = loss_edge + float(args.edge_refiner_weight) * loss_refiner
+
+            if use_edge_enhance and epoch >= int(args.edge_warmup):
                 loss = loss + loss_edge
 
             optimizer.zero_grad()
@@ -1022,8 +1561,10 @@ def main():
             total_loss.update(loss.item())
             total_loss_x.update(loss_x.item())
             total_loss_s.update(loss_u_s.item())
-            if getattr(args, 'temporal_consistency', False):
+            if getattr(args, 'temporal_consistency', False) or getattr(args, 'routed_consistency', False):
                 total_loss_tcr.update(loss_tcr.item())
+            if getattr(args, 'instance_loss', False):
+                total_loss_inst.update(loss_inst.item())
             if use_cls:      total_loss_c.update(loss_c.item())
             if use_edge_enhance: total_loss_edge.update(loss_edge.item())
             if affinity_side is not None:
@@ -1097,11 +1638,24 @@ def main():
                 writer.add_scalar('train/loss_all', loss.item(), iters)
                 writer.add_scalar('train/loss_x', loss_x.item(), iters)
                 writer.add_scalar('train/loss_s', loss_u_s.item(), iters)
-                if getattr(args, 'temporal_consistency', False):
+                if getattr(args, 'temporal_consistency', False) or getattr(args, 'routed_consistency', False):
                     writer.add_scalar('train/loss_tcr', loss_tcr.item(), iters)
+                if getattr(args, 'routed_consistency', False):
+                    writer.add_scalar('train/loss_routed_consistency', loss_routed.item(), iters)
+                if getattr(args, 'instance_loss', False):
+                    writer.add_scalar('train/loss_inst', loss_inst.item(), iters)
                 if use_edge_enhance:
                     writer.add_scalar('train/loss_edge', loss_edge.item(), iters)
                 writer.add_scalar('train/mask_ratio', mask_ratio, iters)
+                # live progress-bar metrics
+                if tqdm is not None and hasattr(loader, 'set_postfix'):
+                    loader.set_postfix(ordered_dict={
+                        'loss': '%.3f' % total_loss.avg,
+                        'x':    '%.3f' % total_loss_x.avg,
+                        's':    '%.3f' % total_loss_s.avg,
+                        'mask': '%.2f' % total_mask_ratio.avg,
+                        'lr':   '%.2e' % optimizer.param_groups[0]['lr'],
+                    })
 
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(pseudo_kept_per_class, op=dist.ReduceOp.SUM)
@@ -1122,24 +1676,154 @@ def main():
         keep_tail = _grp_keep_ratio(hbt_split.get('tail', []))
 
         eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
-        mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg, multiplier=int(getattr(model.module, 'patch_size', 14)) if hasattr(model, 'module') else 14)
-        mIoU_ema, iou_class_ema = evaluate(model_ema, valloader, eval_mode, cfg, multiplier=int(getattr(model.module, 'patch_size', 14)) if hasattr(model, 'module') else 14)
+        _mult = int(getattr(model.module, 'patch_size', 14)) if hasattr(model, 'module') else 14
+        # Evaluate every eval_interval epochs (always on the final epoch) so large
+        # datasets are not bottlenecked by two/four full validation passes per epoch.
+        do_eval = ((epoch % max(1, int(args.eval_interval)) == 0)
+                   or (epoch == cfg['epochs'] - 1))
+
+        _esz = int(getattr(args, 'eval_size', 0))
+        _ema_only = bool(getattr(args, 'eval_ema_only', False))
+        is_best = False
+        if do_eval:
+            (mIoU_ema, iou_class_ema, allAcc_ema, acc_class_ema, mAcc_ema,
+             dice_class_ema, mDice_ema,
+             mIoU_ema_p, mDice_ema_p, mAcc_ema_p, present) = evaluate(
+                model_ema, valloader, eval_mode, cfg, multiplier=_mult, return_acc=True,
+                max_size=_esz, return_present=True, exclude_classes=exclude_classes,
+                desc='val (ema)')
+            if _ema_only:
+                # skip the raw-model pass; mirror EMA metrics so best-selection,
+                # logging and CSV all operate on the EMA model (best.pth = best EMA).
+                (mIoU, iou_class, allAcc, acc_class, mAcc, dice_class, mDice,
+                 mIoU_p, mDice_p, mAcc_p) = (
+                    mIoU_ema, iou_class_ema, allAcc_ema, acc_class_ema, mAcc_ema,
+                    dice_class_ema, mDice_ema, mIoU_ema_p, mDice_ema_p, mAcc_ema_p)
+            else:
+                (mIoU, iou_class, allAcc, acc_class, mAcc, dice_class, mDice,
+                 mIoU_p, mDice_p, mAcc_p, present) = evaluate(
+                    model, valloader, eval_mode, cfg, multiplier=_mult, return_acc=True,
+                    max_size=_esz, return_present=True, exclude_classes=exclude_classes,
+                    desc='val')
+
+            # ---- best-model selection by PRESENT-ONLY val mIoU (raw + EMA) ----
+            is_best = mIoU_p >= previous_best
+            is_best_ema = mIoU_ema_p >= previous_best_ema
+            previous_best = max(mIoU_p, previous_best)
+            previous_best_ema = max(mIoU_ema_p, previous_best_ema)
+            if is_best:
+                best_epoch = epoch
+            if is_best_ema:
+                best_epoch_ema = epoch
+
+            # ---- Affinity proj: plateau-triggered unfreeze (uses val mIoU) ----
+            if (affinity_side is not None
+                    and not args.joint_text_stage
+                    and not affinity_side.module._proj_unfrozen
+                    and epoch >= int(args.affinity_freeze_warmup)):
+                miou_window.append(float(mIoU))
+                if (len(miou_window) == miou_window.maxlen
+                        and (max(miou_window) - min(miou_window)) < float(args.affinity_plateau_eps) * 100.0):
+                    affinity_side.module.unfreeze_proj()
+                    unfreeze_lr = cfg['lr'] * float(args.affinity_unfreeze_lr_mult)
+                    proj_params = affinity_side.module.proj_parameters()
+                    optimizer.add_param_group({'params': proj_params, 'lr': unfreeze_lr})
+                    affinity_proj_param_group_idx = len(optimizer.param_groups) - 1
+                    if rank == 0:
+                        logger.info('[affinity] mIoU plateaued at ep %d (window=%s) → '
+                                    'unfreezing proj with lr=%.6f' %
+                                    (epoch, [round(x, 2) for x in miou_window], unfreeze_lr))
+
+            # ---- Held-out test split: kept OUT of the per-epoch hot path because
+            # it is the single biggest cost (e.g. endovis test=997 high-res frames).
+            #   --test-interval = -1 : never (fully disabled during training)
+            #                       0 : only the final epoch (default)
+            #                      >0 : every N epochs + final epoch
+            # Early in training nearly every epoch is a new best, so we deliberately
+            # do NOT trigger test on "best" — that would run it almost every epoch.
+            _final = (epoch == cfg['epochs'] - 1)
+            _ti = int(getattr(args, 'test_interval', 0))
+            _nan = float('nan')
+            if testloader is None:
+                test_tag, have_test = 'val(copied)', True
+                (tmIoU, tiou_class, tallAcc, tacc_class, tmAcc, tdice_class, tmDice,
+                 tmIoU_p, tmDice_p, tmAcc_p) = \
+                    (mIoU, iou_class, allAcc, acc_class, mAcc, dice_class, mDice,
+                     mIoU_p, mDice_p, mAcc_p)
+                (tmIoU_ema, tiou_class_ema, tallAcc_ema, tacc_class_ema, tmAcc_ema,
+                 tdice_class_ema, tmDice_ema, tmIoU_ema_p, tmDice_ema_p, tmAcc_ema_p) = \
+                    (mIoU_ema, iou_class_ema, allAcc_ema, acc_class_ema, mAcc_ema,
+                     dice_class_ema, mDice_ema, mIoU_ema_p, mDice_ema_p, mAcc_ema_p)
+                present_test = present
+            elif (_ti >= 0) and (_final or (_ti > 0 and epoch % _ti == 0)):
+                test_tag, have_test = 'test', True
+                (tmIoU, tiou_class, tallAcc, tacc_class, tmAcc, tdice_class, tmDice,
+                 tmIoU_p, tmDice_p, tmAcc_p, present_test) = evaluate(
+                    model, testloader, eval_mode, cfg, multiplier=_mult, return_acc=True,
+                    max_size=_esz, return_present=True, exclude_classes=exclude_classes)
+                (tmIoU_ema, tiou_class_ema, tallAcc_ema, tacc_class_ema, tmAcc_ema,
+                 tdice_class_ema, tmDice_ema, tmIoU_ema_p, tmDice_ema_p, tmAcc_ema_p, _) = evaluate(
+                    model_ema, testloader, eval_mode, cfg, multiplier=_mult, return_acc=True,
+                    max_size=_esz, return_present=True, exclude_classes=exclude_classes)
+            else:
+                test_tag, have_test = 'test', False
+                tmIoU = tmIoU_ema = tallAcc = tallAcc_ema = tmAcc = tmAcc_ema = _nan
+                tmDice = tmDice_ema = _nan
+                tmIoU_p = tmIoU_ema_p = tmDice_p = tmDice_ema_p = tmAcc_p = tmAcc_ema_p = _nan
+                present_test = present
 
         epoch_time.update(time.time() - epoch_start)
         remaining_epochs = max(0, cfg['epochs'] - epoch - 1)
         eta = epoch_time.avg * remaining_epochs
 
-        if rank == 0:
-            logger.info('[eval] epoch=%d/%d mode=%s mIoU=%.2f EMA=%.2f '
-                        'best=%.2f bestEMA=%.2f time=%s ETA=%s'
-                        % (epoch + 1, cfg['epochs'], eval_mode, mIoU, mIoU_ema,
-                           max(mIoU, previous_best),
-                           max(mIoU_ema, previous_best_ema),
-                           _format_seconds(epoch_time.val),
-                           _format_seconds(eta)))
-            
+        if do_eval and rank == 0:
+            logger.info('[eval] epoch=%d/%d mode=%s time=%s ETA=%s'
+                        % (epoch + 1, cfg['epochs'], eval_mode,
+                           _format_seconds(epoch_time.val), _format_seconds(eta)))
+            logger.info('[val ] mIoU(pres)=%.2f mDice(pres)=%.2f PixAcc=%.2f  '
+                        '| mIoU(all)=%.2f mAcc(pres)=%.2f   EMA: mIoU(pres)=%.2f mDice(pres)=%.2f '
+                        'PixAcc=%.2f  (best=%.2f bestEMA=%.2f; present-only)'
+                        % (mIoU_p, mDice_p, allAcc, mIoU, mAcc_p,
+                           mIoU_ema_p, mDice_ema_p, allAcc_ema,
+                           previous_best, previous_best_ema))
+            if have_test:
+                logger.info('[%s] mIoU(pres)=%.2f mDice(pres)=%.2f PixAcc=%.2f  '
+                            '| mIoU(all)=%.2f   EMA: mIoU(pres)=%.2f mDice(pres)=%.2f PixAcc=%.2f'
+                            % (test_tag, tmIoU_p, tmDice_p, tallAcc, tmIoU,
+                               tmIoU_ema_p, tmDice_ema_p, tallAcc_ema))
+                from util.classes import display_names as _disp
+                _dn = _disp(cfg['dataset'], cfg['nclass'])
+                for cls_idx in range(cfg['nclass']):
+                    flag = '' if present_test[cls_idx] else ' [absent]'
+                    flag += '' if (cls_idx not in exclude_classes) else ' [excl]'
+                    logger.info('    [%s] cls %d %-10s  IoU=%.2f  Dice=%.2f  PixAcc=%.2f  '
+                                '(EMA IoU=%.2f Dice=%.2f)%s'
+                                % (test_tag, cls_idx, _dn[cls_idx],
+                                   tiou_class[cls_idx], tdice_class[cls_idx], tacc_class[cls_idx],
+                                   tiou_class_ema[cls_idx], tdice_class_ema[cls_idx], flag))
+            else:
+                _msg = ('disabled (--test-interval=-1)' if _ti < 0
+                        else 'runs only on final epoch (--test-interval=0)' if _ti == 0
+                        else 'runs every %d epochs + final' % _ti)
+                logger.info('[test] skipped this epoch — %s' % _msg)
+
             writer.add_scalar('eval/mIoU', mIoU, epoch)
             writer.add_scalar('eval/mIoU_ema', mIoU_ema, epoch)
+            writer.add_scalar('eval/mIoU_present', mIoU_p, epoch)
+            writer.add_scalar('eval/mIoU_present_ema', mIoU_ema_p, epoch)
+            writer.add_scalar('eval/mDice', mDice, epoch)
+            writer.add_scalar('eval/mDice_ema', mDice_ema, epoch)
+            writer.add_scalar('eval/mDice_present', mDice_p, epoch)
+            writer.add_scalar('eval/mAcc', mAcc, epoch)
+            writer.add_scalar('eval/PixAcc', allAcc, epoch)
+            writer.add_scalar('eval/PixAcc_ema', allAcc_ema, epoch)
+            if have_test:
+                writer.add_scalar('test/mIoU', tmIoU, epoch)
+                writer.add_scalar('test/mIoU_ema', tmIoU_ema, epoch)
+                writer.add_scalar('test/mIoU_present', tmIoU_p, epoch)
+                writer.add_scalar('test/mIoU_present_ema', tmIoU_ema_p, epoch)
+                writer.add_scalar('test/mDice', tmDice, epoch)
+                writer.add_scalar('test/PixAcc', tallAcc, epoch)
             for i, iou in enumerate(iou_class):
                 writer.add_scalar('eval/%s_IoU' % (CLASSES[cfg['dataset']][i]), iou, epoch)
                 writer.add_scalar('eval/%s_IoU_ema' % (CLASSES[cfg['dataset']][i]), iou_class_ema[i], epoch)
@@ -1159,10 +1843,27 @@ def main():
                     header += [f'keep_ratio_{c}' for c in cnames]
                     header += [f'pseudo_kept_{c}' for c in cnames]
                     header += [f'pseudo_total_{c}' for c in cnames]
+                    # pixel-accuracy / Dice + test-split columns appended at the end so
+                    # existing positional CSV readers keep working.
+                    header += ['val_mAcc', 'val_PixAcc', 'val_mAcc_ema', 'val_PixAcc_ema',
+                               'val_mDice', 'val_mDice_ema',
+                               'test_mIoU', 'test_mIoU_ema', 'test_mAcc', 'test_PixAcc',
+                               'test_mAcc_ema', 'test_PixAcc_ema',
+                               'test_mDice', 'test_mDice_ema']
+                    # present-only columns (absent + excluded classes dropped); the
+                    # existing mIoU / *_mIoU columns above stay all-class for compat.
+                    header += ['val_mIoU_present', 'val_mIoU_present_ema',
+                               'val_mDice_present', 'val_mDice_present_ema',
+                               'test_mIoU_present', 'test_mIoU_present_ema',
+                               'test_mDice_present', 'test_mDice_present_ema']
+                    # appended at the very end so existing positional CSV readers
+                    # keep working regardless of whether --instance-loss is on.
+                    header += ['loss_inst']
                     f.write(','.join(header) + '\n')
                 row = [epoch, optimizer.param_groups[0]['lr'],
                        total_loss.avg, total_loss_x.avg, total_loss_s.avg,
-                       (total_loss_tcr.avg if getattr(args, 'temporal_consistency', False) else 0.0),
+                       (total_loss_tcr.avg if (getattr(args, 'temporal_consistency', False)
+                                               or getattr(args, 'routed_consistency', False)) else 0.0),
                        (total_loss_c.avg if use_cls      else 0.0),
                        (total_loss_aff.avg if affinity_side is not None else 0.0),
                        (total_loss_edge.avg if use_edge_enhance else 0.0),
@@ -1174,40 +1875,26 @@ def main():
                 row += [float(x) for x in keep_ratio_per_class]
                 row += [int(x) for x in kept_np]
                 row += [int(x) for x in total_np]
+                row += [float(mAcc), float(allAcc), float(mAcc_ema), float(allAcc_ema),
+                        float(mDice), float(mDice_ema),
+                        float(tmIoU), float(tmIoU_ema), float(tmAcc), float(tallAcc),
+                        float(tmAcc_ema), float(tallAcc_ema),
+                        float(tmDice), float(tmDice_ema)]
+                row += [float(mIoU_p), float(mIoU_ema_p),
+                        float(mDice_p), float(mDice_ema_p),
+                        float(tmIoU_p), float(tmIoU_ema_p),
+                        float(tmDice_p), float(tmDice_ema_p)]
+                row += [(total_loss_inst.avg if getattr(args, 'instance_loss', False) else 0.0)]
                 f.write(','.join('%.6f' % v if isinstance(v, float) else str(v) for v in row) + '\n')
 
             writer.add_scalar('train/keep_ratio_head', keep_head, epoch)
             writer.add_scalar('train/keep_ratio_body', keep_body, epoch)
             writer.add_scalar('train/keep_ratio_tail', keep_tail, epoch)
+        elif rank == 0:
+            logger.info('[eval] epoch=%d/%d skipped (eval_interval=%d) time=%s ETA=%s'
+                        % (epoch + 1, cfg['epochs'], int(args.eval_interval),
+                           _format_seconds(epoch_time.val), _format_seconds(eta)))
 
-        # ---- Affinity proj: plateau-triggered unfreeze ----
-        if (affinity_side is not None
-                and not args.joint_text_stage
-                and not affinity_side.module._proj_unfrozen
-                and epoch >= int(args.affinity_freeze_warmup)):
-            miou_window.append(float(mIoU))
-            if (len(miou_window) == miou_window.maxlen
-                    and (max(miou_window) - min(miou_window)) < float(args.affinity_plateau_eps) * 100.0):
-                # mIoU is reported as percentage (e.g. 65.32) so eps is also in % units
-                affinity_side.module.unfreeze_proj()
-                unfreeze_lr = cfg['lr'] * float(args.affinity_unfreeze_lr_mult)
-                proj_params = affinity_side.module.proj_parameters()
-                optimizer.add_param_group({'params': proj_params, 'lr': unfreeze_lr})
-                affinity_proj_param_group_idx = len(optimizer.param_groups) - 1
-                if rank == 0:
-                    logger.info('[affinity] mIoU plateaued at ep %d (window=%s) → '
-                                'unfreezing proj with lr=%.6f' %
-                                (epoch, [round(x, 2) for x in miou_window], unfreeze_lr))
-
-        is_best = mIoU >= previous_best
-
-        previous_best = max(mIoU, previous_best)
-        previous_best_ema = max(mIoU_ema, previous_best_ema)
-        if mIoU == previous_best:
-            best_epoch = epoch
-        if mIoU_ema == previous_best_ema:
-            best_epoch_ema = epoch
-        
         if rank == 0:
             checkpoint = {
                 'model': model.state_dict(),
@@ -1224,6 +1911,15 @@ def main():
                     'enabled': True,
                     'reduction': int(args.visual_adapter_reduction),
                     'dropout': float(args.visual_adapter_dropout),
+                    'moe': bool(args.visual_adapter_moe),
+                    'moe_edge_cond': bool(args.moe_edge_cond),
+                    'moe_text_cond_dim': int(args.moe_text_cond_dim),
+                }
+            if use_edge_enhance:
+                checkpoint['edge'] = {
+                    'enabled': True,
+                    'refiner': bool(args.edge_refiner),
+                    'residual_adapters': bool(use_edge_residual_adapters),
                 }
             if use_cls:
                 checkpoint['cls_head'] = cls_head.state_dict()
@@ -1235,11 +1931,38 @@ def main():
                 if affinity_side_ema is not None:
                     checkpoint['affinity_side_ema'] = \
                         affinity_side_ema.module.state_dict_for_save()
+            if routed_pack is not None:
+                checkpoint['routed_consistency'] = routed_pack['loss'].state_dict()
+                checkpoint['routed_consistency_meta'] = {
+                    'enabled': True,
+                    'route': str(args.route),
+                    'weight': float(args.consistency_weight),
+                    'beta': float(args.consistency_beta),
+                    'warmup': int(args.consistency_warmup),
+                    'use_edge': bool(args.consistency_use_edge),
+                }
             tmp_path = os.path.join(args.save_path, 'latest.pth.tmp')
             torch.save(checkpoint, tmp_path)
             os.replace(tmp_path, os.path.join(args.save_path, 'latest.pth'))
             if is_best:
-                torch.save(checkpoint, os.path.join(args.save_path, 'best.pth'))
+                # best.pth is only ever used for evaluation, so drop the bulky
+                # AdamW optimizer state (≈ 2× params fp32). This halves the file
+                # and avoids a host-RAM spike when test.py loads it.
+                best_ckpt = {k: v for k, v in checkpoint.items() if k != 'optimizer'}
+                torch.save(best_ckpt, os.path.join(args.save_path, 'best.pth'))
+
+            # ---- per-epoch DELTA: trainable (non-backbone) weights only, fp16 ----
+            if save_deltas:
+                def _strip_bb(sd):
+                    return {k: (v.half() if torch.is_floating_point(v) else v)
+                            for k, v in sd.items() if not k.startswith('backbone.')}
+                delta = {k: v for k, v in checkpoint.items()
+                         if k not in ('model', 'model_ema', 'optimizer')}
+                delta['model'] = _strip_bb(checkpoint['model'])
+                delta['model_ema'] = _strip_bb(checkpoint['model_ema'])
+                delta['is_delta'] = True
+                torch.save(delta, os.path.join(args.save_path, 'deltas',
+                                               'ep%03d.pth' % epoch))
 
 
 if __name__ == '__main__':

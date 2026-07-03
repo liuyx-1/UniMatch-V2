@@ -20,10 +20,12 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import time
 from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 import torch
 import torch.nn.functional as F
 import yaml
@@ -43,12 +45,31 @@ from util.edge_enhance import EdgeSegResidualAdapter, rgb_edge_prior, edge_to_to
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--config',     type=str, required=True)
-    p.add_argument('--checkpoint', type=str, required=True,
+    p.add_argument('--checkpoint', type=str, default=None,
                     help='best.pth / latest.pth produced by unimatch_v2.py')
+    p.add_argument('--delta', type=str, default=None,
+                    help='per-epoch delta ckpt (deltas/epNNN.pth); merged with '
+                         '--frozen to reconstruct the full model')
+    p.add_argument('--frozen', type=str, default=None,
+                    help='frozen_base.pth for --delta (default: sibling of the '
+                         'delta dir, i.e. <save_path>/frozen_base.pth)')
     p.add_argument('--id-path',    type=str, required=True,
                     help='split file (val.txt or test.txt) — image\\tmask per line')
     p.add_argument('--use-ema',    action='store_true',
                     help='evaluate model_ema state_dict instead of model state_dict')
+    p.add_argument('--save-preds', type=str, default=None,
+                    help='Directory to save per-frame predicted masks (PNG, value=class id). '
+                         'Use with a sequence-filtered --id-path to dump one sequence.')
+    p.add_argument('--show', action='store_true',
+                    help='Streaming: live OpenCV window during inference (overlay + per-frame '
+                         'mIoU/mDice/FPS). Needs a display; auto-skips on headless.')
+    p.add_argument('--save-video', type=str, default=None,
+                    help='Streaming: write the overlay frames to an mp4 during inference '
+                         '(one pass, no post-processing). Works with unknown-GT (1-column) lists.')
+    p.add_argument('--video-fps', type=float, default=12.0)
+    p.add_argument('--eval-size', type=int, default=0,
+                   help='cap inference long-side to this many px (0=full res); '
+                        'predictions are upsampled back to original size. Use to avoid OOM.')
     p.add_argument('--save-csv',   type=str, default=None,
                     help='optional CSV path for per-class metrics')
     p.add_argument('--ignore-index', type=int, default=255)
@@ -98,8 +119,9 @@ def _strip_prefix(sd, prefixes=('module.', '_orig_mod.')):
     return out
 
 
-def load_checkpoint(model, ckpt_path, use_ema=False):
-    ck = torch.load(ckpt_path, map_location='cpu')
+def load_checkpoint(model, ckpt_path, use_ema=False, ck=None):
+    if ck is None:
+        ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     key = 'model_ema' if use_ema else 'model'
     if key not in ck:
         # fall back to whichever is available
@@ -110,12 +132,251 @@ def load_checkpoint(model, ckpt_path, use_ema=False):
     return ck.get('epoch', None), ck.get('mIoU', None), ck.get('mIoU_ema', None)
 
 
+def _resolve_visual_adapter_cfg(model, ck, ck_model,
+                                default_reduction=8, default_dropout=0.0):
+    va_cfg = ck.get('visual_adapter') or {}
+    va_reduction = int(va_cfg.get('reduction', default_reduction))
+    va_dropout = float(va_cfg.get('dropout', default_dropout))
+    is_moe = bool(va_cfg.get('moe', False)) or any(
+        k.endswith('visual_adapter.blocks.0.router.0.weight')
+        or '.visual_adapter.blocks.0.router.0.weight' in k
+        for k in ck_model.keys())
+    moe_edge_cond = bool(va_cfg.get('moe_edge_cond', False)) or any(
+        k.endswith('visual_adapter.blocks.0.edge_proj.weight')
+        or '.visual_adapter.blocks.0.edge_proj.weight' in k
+        for k in ck_model.keys())
+    moe_text_cond_dim = int(va_cfg.get('moe_text_cond_dim', 0))
+    text_key = next((k for k in ck_model.keys()
+                     if k.endswith('visual_adapter.blocks.0.text_proj.weight')), None)
+    if text_key is not None:
+        moe_text_cond_dim = int(ck_model[text_key].shape[1])
+    down_key = next((k for k in ck_model.keys()
+                     if k.endswith('visual_adapter.blocks.0.down.weight')), None)
+    if down_key is not None:
+        hidden = int(ck_model[down_key].shape[0])
+        if hidden > 0:
+            va_reduction = max(1, int(model.backbone.embed_dim) // hidden)
+    return va_reduction, va_dropout, is_moe, moe_edge_cond, moe_text_cond_dim
+
+
+def _make_moe_text_cond_fn(model, affinity_side):
+    if affinity_side is None:
+        return None
+    if not (getattr(model, '_va_is_moe', False)
+            and int(getattr(model, '_moe_text_cond_dim', 0)) > 0):
+        return None
+
+    def _fn(patches, patch_h, patch_w, edge_prior):
+        with torch.no_grad():
+            cond = affinity_side.moe_text_condition(
+                patches.detach(), patch_hw=(patch_h, patch_w),
+                edge_prior=edge_prior)
+        expected = int(model._moe_text_cond_dim)
+        if cond.shape[-1] != expected:
+            raise RuntimeError(
+                f"MOE_TEXT_COND_DIM={expected} but LC-PAM emits "
+                f"{cond.shape[-1]} dims."
+            )
+        return cond
+    return _fn
+
+
+def _adapt_with_moe_text(model, affinity_side, features, patch_h, patch_w, edge_prior):
+    text_cond = None
+    fn = _make_moe_text_cond_fn(model, affinity_side)
+    if fn is not None:
+        text_cond = fn(features[-1], patch_h, patch_w, edge_prior)
+    edge_cond = None
+    if getattr(model, '_va_is_moe', False) and getattr(model, '_moe_edge_cond_dim', 0) > 0:
+        if edge_prior is not None:
+            edge_cond = edge_to_tokens(edge_prior.detach(), patch_h, patch_w)
+            if edge_cond.dim() == 3 and edge_cond.shape[-1] != 1:
+                edge_cond = edge_cond.mean(dim=-1, keepdim=True)
+    return model.adapt_features(features, patch_h, patch_w,
+                                text_cond=text_cond, edge_cond=edge_cond)
+
+
 # ----------------------------------------------------------------------
 @torch.no_grad()
+def _id_to_stem(id_str):
+    """Extract the image-file stem from a split-line id ('img_rel<TAB>mask_rel')."""
+    first = id_str.split('\t')[0] if '\t' in id_str else id_str.split()[0]
+    return os.path.splitext(os.path.basename(first))[0]
+
+
+# --- streaming overlay helpers (used by --show / --save-video) -------------
+_STREAM_PALETTE = [
+    (0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255),
+    (255, 0, 255), (255, 255, 0), (0, 128, 255), (128, 0, 255),
+]
+_IMG_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMG_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def _denorm_to_bgr(img_t):
+    """Normalized CHW float tensor -> HxWx3 uint8 BGR image."""
+    x = img_t.detach().cpu().numpy().transpose(1, 2, 0)
+    x = (x * _IMG_STD + _IMG_MEAN) * 255.0
+    x = np.clip(x, 0, 255).astype(np.uint8)
+    import cv2
+    return cv2.cvtColor(x, cv2.COLOR_RGB2BGR)
+
+
+def _overlay_pred_bgr(bgr, pred, alpha=0.5):
+    import cv2
+    out = bgr.copy()
+    for v in np.unique(pred):
+        if v == 0:
+            continue
+        region = pred == v
+        color = _STREAM_PALETTE[(int(v) - 1) % len(_STREAM_PALETTE)]
+        colored = np.zeros_like(out); colored[region] = color
+        out[region] = cv2.addWeighted(out[region], 1 - alpha, colored[region], alpha, 0)
+        cnts, _ = cv2.findContours(region.astype(np.uint8) * 255,
+                                   cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(out, cnts, -1, color, 2)
+    return out
+
+
+def _frame_miou_dice(pred, gt, ignore):
+    """Per-frame mIoU/mDice over classes present in (pred|gt); None if no valid GT."""
+    valid = gt != ignore
+    if valid.sum() == 0:
+        return None, None
+    p = pred[valid]; g = gt[valid]
+    ious, dices = [], []
+    for c in np.unique(np.concatenate([p, g])):
+        pc = p == c; gc = g == c
+        inter = np.logical_and(pc, gc).sum()
+        union = np.logical_or(pc, gc).sum()
+        denom = pc.sum() + gc.sum()
+        if union > 0: ious.append(inter / union)
+        if denom > 0: dices.append(2.0 * inter / denom)
+    mi = float(np.mean(ious)) if ious else float('nan')
+    md = float(np.mean(dices)) if dices else float('nan')
+    return mi, md
+
+
+def _draw_hud(img, lines):
+    import cv2
+    for i, t in enumerate(lines):
+        y = 26 + i * 24
+        cv2.putText(img, t, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(img, t, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 1, cv2.LINE_AA)
+    return img
+
+
+# --- reusable model assembly + single-frame inference (for true streaming) ---
+def build_inference_model(cfg, checkpoint, device, visual_adapter=True,
+                          affinity_warmstart=None, use_ema=False,
+                          visual_adapter_reduction=8, visual_adapter_dropout=0.0):
+    """Assemble DPT (+ HPTA / edge / edge_refiner / cls_head / affinity_side) from a
+    checkpoint, mirroring test.main(). Returns a dict ready for infer_pred().
+    """
+    from util.classes import display_names
+    nclass = int(cfg['nclass'])
+    class_names = display_names(cfg['dataset'], nclass)
+
+    model = build_model(cfg)
+    ck = torch.load(checkpoint, map_location='cpu', weights_only=False)
+    ck.pop('optimizer', None)
+    ck_model = ck.get('model_ema' if use_ema else 'model', ck.get('model', ck.get('model_ema', {})))
+
+    has_edge_seg = any(k.endswith('edge_seg_adapter.gamma') or '.edge_seg_adapter.' in k
+                       for k in ck_model.keys())
+    has_visual_adapter = visual_adapter or any(
+        k.startswith('visual_adapter.') or '.visual_adapter.' in k for k in ck_model.keys())
+    if has_visual_adapter:
+        va_reduction, va_dropout, is_moe, moe_edge_cond, moe_text_cond_dim = \
+            _resolve_visual_adapter_cfg(
+                model, ck, ck_model, visual_adapter_reduction,
+                visual_adapter_dropout)
+        model.enable_visual_adapter(
+            reduction=va_reduction, dropout=va_dropout,
+            moe=is_moe, moe_edge_cond=moe_edge_cond,
+            moe_text_cond_dim=moe_text_cond_dim)
+    if has_edge_seg:
+        model.edge_seg_adapter = EdgeSegResidualAdapter(model.backbone.embed_dim)
+    if any('edge_refiner.' in k for k in ck_model.keys()):
+        from util.edge_enhance import MaskGuidedEdgeRefiner
+        model.edge_refiner = MaskGuidedEdgeRefiner(mid=16, dropout=0.0)
+    load_checkpoint(model, checkpoint, use_ema=use_ema, ck=ck)
+    model = model.to(device).eval()
+
+    affinity_side = None
+    if affinity_warmstart or 'affinity_side' in ck:
+        from util.affinity_side import AffinitySideBranch
+        init_source = affinity_warmstart if affinity_warmstart else ck['affinity_side']
+        affinity_side = AffinitySideBranch(init_source, n_orig_classes=nclass,
+                                           class_names=class_names, dataset=cfg['dataset'])
+        if 'affinity_side' in ck and ck['affinity_side'].get('edge_text_adapter') is not None:
+            affinity_side.enable_edge_enhance()
+        affinity_side = affinity_side.to(device).eval()
+        if 'affinity_side' in ck:
+            affinity_side.load_state_dict_from_save(ck['affinity_side'])
+        if not ck.get('affinity_proj_unfrozen', False):
+            affinity_side.freeze_proj()
+    del ck
+    patch_size = int(getattr(model.backbone, 'patch_size', 14))
+    return {
+        'model': model, 'affinity_side': affinity_side,
+        'patch_size': patch_size, 'use_edge_enhance': has_edge_seg,
+        'nclass': nclass, 'class_names': class_names,
+    }
+
+
+@torch.no_grad()
+def infer_pred(bundle, img_chw, device):
+    """Run inference on a single normalized CHW float tensor -> pred HxW uint8 (class ids)."""
+    model = bundle['model']
+    affinity_side = bundle['affinity_side']
+    patch_size = bundle['patch_size']
+    use_edge_enhance = bundle['use_edge_enhance']
+
+    img = img_chw.unsqueeze(0).to(device)
+    ori_h, ori_w = img.shape[-2:]
+    new_h = max(patch_size, int(round(ori_h / patch_size)) * patch_size)
+    new_w = max(patch_size, int(round(ori_w / patch_size)) * patch_size)
+    img_in = F.interpolate(img, (new_h, new_w), mode='bilinear', align_corners=True) \
+        if (new_h, new_w) != (ori_h, ori_w) else img
+
+    edge_in = rgb_edge_prior(img_in) if use_edge_enhance else None
+    if edge_in is not None and hasattr(model, 'edge_refiner'):
+        edge_in = model.edge_refiner(img_in, edge_in)
+
+    if affinity_side is not None:
+        moe_text_cond_fn = _make_moe_text_cond_fn(model, affinity_side)
+        logits, cls_tok, patches = model(
+            img_in, return_cls=True, edge_prior=edge_in,
+            moe_text_cond_fn=moe_text_cond_fn)
+        ph, pw = img_in.shape[-2] // patch_size, img_in.shape[-1] // patch_size
+        side = affinity_side(patches, logits.shape[-2], logits.shape[-1],
+                             patch_hw=(ph, pw), edge_prior=edge_in)
+        if getattr(affinity_side, 'affinity_metric', '') in ('hyperbolic_pathway', 'cma'):
+            x_aware = getattr(affinity_side, 'last_x_aware', None)
+            if x_aware is not None:
+                if use_edge_enhance and hasattr(model, 'edge_seg_adapter'):
+                    x_aware, _ = model.edge_seg_adapter(x_aware, edge_to_tokens(edge_in, ph, pw), ph, pw)
+                feats, _, _, _ = model.encode(img_in, return_cls=False)
+                feats = list(_adapt_with_moe_text(
+                    model, affinity_side, feats, ph, pw, edge_in))
+                feats[-1] = x_aware
+                logits = model.decode(feats, ph, pw, comp_drop=False)
+        logits = affinity_side.fuse(logits, side)
+    else:
+        logits = model(img_in, edge_prior=edge_in)
+
+    if logits.shape[-2:] != (ori_h, ori_w):
+        logits = F.interpolate(logits, size=(ori_h, ori_w), mode='bilinear', align_corners=True)
+    pred = logits.argmax(dim=1)[0].detach().cpu().numpy().astype(np.uint8)
+    return pred
+
+
 def collect_predictions(model, loader, nclass, ignore_index, device, collect_ap=False,
                          patch_size=16, cls_head=None, cls_min_pixels=32,
                          ece: ECEAccumulator = None, affinity_side=None,
-                         use_edge_enhance=False):
+                         use_edge_enhance=False, save_preds_dir=None,
+                         show=False, save_video=None, video_fps=12.0, eval_size=0):
     """Returns (confusion_matrix [C,C], optional ap_scores dict).
 
     Validation images can have arbitrary HxW. We resize the input so both sides
@@ -130,14 +391,31 @@ def collect_predictions(model, loader, nclass, ignore_index, device, collect_ap=
     cls_pred_all, cls_true_all = [], []
 
     model.eval()
-    for batch in loader:
-        img, mask, _ = batch
+    n_total = len(loader)
+    is_cuda = (getattr(device, 'type', str(device)) == 'cuda') or str(device).startswith('cuda')
+    timing_rows = []  # (stem, seconds, fps) per frame when saving preds
+    stream_on = bool(save_preds_dir) or show or bool(save_video)
+    stream_writer = None
+    stream_aborted = False
+    for _bi, batch in enumerate(loader):
+        if _bi % 100 == 0:
+            print(f'[eval] {_bi}/{n_total}', flush=True)
+        img, mask, ids = batch
+        if is_cuda:
+            torch.cuda.synchronize()
+        _t0 = time.perf_counter()
         img = img.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True).long()
 
         ori_h, ori_w = img.shape[-2:]
-        new_h = max(patch_size, int(round(ori_h / patch_size)) * patch_size)
-        new_w = max(patch_size, int(round(ori_w / patch_size)) * patch_size)
+        # Optional long-side cap to bound attention memory (pred is upsampled
+        # back to the original mask size below, so output resolution is intact).
+        ref_h, ref_w = ori_h, ori_w
+        if eval_size and max(ori_h, ori_w) > eval_size:
+            scale = eval_size / float(max(ori_h, ori_w))
+            ref_h, ref_w = int(round(ori_h * scale)), int(round(ori_w * scale))
+        new_h = max(patch_size, int(round(ref_h / patch_size)) * patch_size)
+        new_w = max(patch_size, int(round(ref_w / patch_size)) * patch_size)
         if (new_h, new_w) != (ori_h, ori_w):
             img_in = F.interpolate(img, (new_h, new_w), mode='bilinear', align_corners=True)
         else:
@@ -148,7 +426,10 @@ def collect_predictions(model, loader, nclass, ignore_index, device, collect_ap=
             edge_in = model.edge_refiner(img_in, edge_in)
         need_patches = cls_head is not None or affinity_side is not None
         if need_patches:
-            logits, cls_tok, patches = model(img_in, return_cls=True, edge_prior=edge_in)
+            moe_text_cond_fn = _make_moe_text_cond_fn(model, affinity_side)
+            logits, cls_tok, patches = model(
+                img_in, return_cls=True, edge_prior=edge_in,
+                moe_text_cond_fn=moe_text_cond_fn)
             if affinity_side is not None:
                 patch_h = img_in.shape[-2] // patch_size
                 patch_w = img_in.shape[-1] // patch_size
@@ -171,7 +452,8 @@ def collect_predictions(model, loader, nclass, ignore_index, device, collect_ap=
                             x_aware, _ = model.edge_seg_adapter(
                                 x_aware, edge_to_tokens(edge_in, ph, pw), ph, pw)
                         feats, _, _, _ = model.encode(img_in, return_cls=False)
-                        feats = list(model.adapt_features(feats, ph, pw))
+                        feats = list(_adapt_with_moe_text(
+                            model, affinity_side, feats, ph, pw, edge_in))
                         feats[-1] = x_aware
                         logits = model.decode(feats, ph, pw, comp_drop=False)
                 logits = affinity_side.fuse(logits, side)
@@ -194,6 +476,48 @@ def collect_predictions(model, loader, nclass, ignore_index, device, collect_ap=
         prob = logits.softmax(dim=1)
         conf, pred = prob.max(dim=1)
 
+        if stream_on:
+            if is_cuda:
+                torch.cuda.synchronize()
+            bsz = pred.shape[0]
+            dt = max(time.perf_counter() - _t0, 1e-9)
+            per_frame_sec = dt / bsz
+            per_frame_fps = 1.0 / per_frame_sec
+            pred_np = pred.detach().cpu().numpy().astype(np.uint8)  # [B,H,W], value=class id
+            mask_np = mask.detach().cpu().numpy()
+            for b in range(pred_np.shape[0]):
+                stem = _id_to_stem(ids[b])
+                if save_preds_dir is not None:
+                    Image.fromarray(pred_np[b]).save(os.path.join(save_preds_dir, stem + '.png'))
+                    timing_rows.append((stem, round(per_frame_sec, 5), round(per_frame_fps, 3)))
+                if show or save_video:
+                    import cv2
+                    bgr = _denorm_to_bgr(img[b])
+                    vis = _overlay_pred_bgr(bgr, pred_np[b])
+                    mi, md = _frame_miou_dice(pred_np[b], mask_np[b], ignore_index)
+                    hud = [stem]
+                    if mi is not None:
+                        hud.append(f"mIoU {mi*100:5.1f}%   mDice {md*100:5.1f}%")
+                    hud.append(f"FPS {per_frame_fps:5.2f}")
+                    vis = _draw_hud(vis, hud)
+                    if save_video:
+                        if stream_writer is None:
+                            os.makedirs(os.path.dirname(os.path.abspath(save_video)) or '.', exist_ok=True)
+                            h, w = vis.shape[:2]
+                            stream_writer = cv2.VideoWriter(
+                                save_video, cv2.VideoWriter_fourcc(*'mp4v'),
+                                float(video_fps), (w, h))
+                        stream_writer.write(vis)
+                    if show:
+                        try:
+                            cv2.imshow('UniMatch-V2 stream (ESC to stop)', vis)
+                            if (cv2.waitKey(1) & 0xFF) == 27:
+                                stream_aborted = True
+                        except cv2.error:
+                            show = False
+        if stream_aborted:
+            break
+
         valid = (mask != ignore_index)
         v_pred = pred[valid]
         v_mask = mask[valid]
@@ -211,6 +535,25 @@ def collect_predictions(model, loader, nclass, ignore_index, device, collect_ap=
             for c in range(nclass):
                 ap_scores[c]['p'].append(prob[:, c][valid].detach().cpu().numpy().astype(np.float32))
                 ap_scores[c]['t'].append((v_mask == c).cpu().numpy().astype(np.uint8))
+    if stream_writer is not None:
+        stream_writer.release()
+        print(f'[stream] wrote video -> {save_video}', flush=True)
+    if show:
+        try:
+            import cv2
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+    if save_preds_dir is not None and timing_rows:
+        with open(os.path.join(save_preds_dir, '_timing.csv'), 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['stem', 'seconds', 'fps'])
+            w.writerows(timing_rows)
+        mean_fps = len(timing_rows) / sum(r[1] for r in timing_rows)
+        print(f'[timing] {len(timing_rows)} frames, mean inference fps = {mean_fps:.2f} '
+              f'(device={device})', flush=True)
+
     cls_pack = None
     if cls_head is not None and cls_pred_all:
         cls_pack = (np.concatenate(cls_pred_all, axis=0),
@@ -370,7 +713,8 @@ def main():
     device = torch.device(args.device)
 
     nclass = int(cfg['nclass'])
-    class_names = CLASSES[cfg['dataset']] if cfg['dataset'] in CLASSES else [f'cls{c}' for c in range(nclass)]
+    from util.classes import display_names as _disp
+    class_names = _disp(cfg['dataset'], nclass)        # paper short names when available
     assert len(class_names) == nclass, \
         f"class_names length ({len(class_names)}) != nclass ({nclass})"
 
@@ -379,7 +723,24 @@ def main():
         cfg['backbone'] = args.backbone
 
     model = build_model(cfg)
-    ck = torch.load(args.checkpoint, map_location='cpu')
+    if args.delta:
+        # Reconstruct a full checkpoint = frozen backbone + per-epoch delta.
+        frozen_path = args.frozen or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(args.delta))), 'frozen_base.pth')
+        fb = torch.load(frozen_path, map_location='cpu', weights_only=False)['backbone']
+        dl = torch.load(args.delta, map_location='cpu', weights_only=False)
+        ck = {k: v for k, v in dl.items() if k not in ('model', 'model_ema')}
+        ck['model'] = {**fb, **dl['model']}
+        ck['model_ema'] = {**fb, **dl.get('model_ema', dl['model'])}
+        print(f'[delta] merged frozen={frozen_path} + delta={args.delta} '
+              f'(epoch={dl.get("epoch")})')
+    else:
+        if not args.checkpoint:
+            raise SystemExit('provide either --checkpoint or --delta')
+        ck = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    # Optimizer state (AdamW moments ≈ 2× params) is never needed at test time.
+    # Drop it immediately so it does not sit in host RAM beside the model copies.
+    ck.pop('optimizer', None)
     ck_model = ck.get('model_ema' if args.use_ema else 'model', ck.get('model', ck.get('model_ema', {})))
     has_edge_seg = any(k.endswith('edge_seg_adapter.gamma') or '.edge_seg_adapter.' in k
                        for k in ck_model.keys())
@@ -388,21 +749,21 @@ def main():
         for k in ck_model.keys()
     )
     if has_visual_adapter:
-        va_cfg = ck.get('visual_adapter') or {}
-        va_reduction = int(va_cfg.get('reduction', args.visual_adapter_reduction))
-        va_dropout = float(va_cfg.get('dropout', args.visual_adapter_dropout))
-        down_key = next((k for k in ck_model.keys()
-                         if k.endswith('visual_adapter.blocks.0.down.weight')), None)
-        if down_key is not None:
-            hidden = int(ck_model[down_key].shape[0])
-            if hidden > 0:
-                va_reduction = max(1, int(model.backbone.embed_dim) // hidden)
+        va_reduction, va_dropout, is_moe, moe_edge_cond, moe_text_cond_dim = \
+            _resolve_visual_adapter_cfg(
+                model, ck, ck_model, args.visual_adapter_reduction,
+                args.visual_adapter_dropout)
         model.enable_visual_adapter(
             reduction=va_reduction,
             dropout=va_dropout,
+            moe=is_moe,
+            moe_edge_cond=moe_edge_cond,
+            moe_text_cond_dim=moe_text_cond_dim,
         )
-        print(f'[visual-adapter] loaded DinoDPTAdapter from checkpoint  '
-              f'reduction={va_reduction}  dropout={va_dropout:.3f}')
+        print(f'[visual-adapter] loaded '
+              f'{"HPTA-MoE" if is_moe else "DinoDPTAdapter"} from checkpoint  '
+              f'reduction={va_reduction}  dropout={va_dropout:.3f}  '
+              f'edge_cond={moe_edge_cond}  text_dim={moe_text_cond_dim}')
     if has_edge_seg:
         model.edge_seg_adapter = EdgeSegResidualAdapter(model.backbone.embed_dim)
         print('[edge] loaded edge_seg_adapter from checkpoint')
@@ -411,8 +772,20 @@ def main():
         from util.edge_enhance import MaskGuidedEdgeRefiner
         model.edge_refiner = MaskGuidedEdgeRefiner(mid=16, dropout=0.0)
         print('[edge] loaded MaskGuidedEdgeRefiner from checkpoint')
-    ep, ck_miou, ck_miou_ema = load_checkpoint(model, args.checkpoint, use_ema=args.use_ema)
+    ep, ck_miou, ck_miou_ema = load_checkpoint(model, args.checkpoint,
+                                               use_ema=args.use_ema, ck=ck)
     model = model.to(device).eval()
+
+    # ---- Model parameter count (total / encoder / decoder / trainable) ----
+    from util.utils import count_params
+    _tot = count_params(model)
+    _enc = count_params(model.backbone) if hasattr(model, 'backbone') else 0.0
+    _dec = count_params(model.head) if hasattr(model, 'head') else 0.0
+    _tr = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+    _peft = sum(p.numel() for n, p in model.named_parameters()
+                if ('backbone' not in n)) / 1e6
+    print(f'[params] total={_tot:.2f}M  encoder={_enc:.2f}M  decoder={_dec:.2f}M  '
+          f'trainable={_tr:.2f}M  non-backbone(PEFT+head)={_peft:.2f}M')
 
     # Optional aux cls head — loaded if present in the checkpoint
     cls_head = None
@@ -464,11 +837,18 @@ def main():
             affinity_side.freeze_proj()
         print(f'[affinity] enabled source={args.affinity_warmstart or "checkpoint"}')
 
+    # All sub-states have been consumed (model / cls_head / affinity_side /
+    # visual_adapter cfg). Release the full host-RAM checkpoint before inference.
+    del ck
+    import gc; gc.collect()
+
     valset = SemiDataset(cfg['dataset'], cfg['data_root'], 'val', id_path=args.id_path)
     loader = DataLoader(valset, batch_size=1, num_workers=2, pin_memory=True)
 
     ece = ECEAccumulator(n_bins=args.ece_bins) if (args.ece and not args.no_bias) else None
 
+    if args.save_preds:
+        os.makedirs(args.save_preds, exist_ok=True)
     cm, pred_count, ap_scores, cls_pack = collect_predictions(
         model, loader, nclass, args.ignore_index, device, collect_ap=args.ap,
         patch_size=int(getattr(model.backbone, 'patch_size', 14)),
@@ -476,6 +856,11 @@ def main():
         ece=ece,
         affinity_side=affinity_side,
         use_edge_enhance=has_edge_seg,
+        save_preds_dir=args.save_preds,
+        show=args.show,
+        save_video=args.save_video,
+        video_fps=args.video_fps,
+        eval_size=args.eval_size,
     )
     metrics = compute_metrics(cm, exclude=args.exclude_classes)
     ap = compute_ap(ap_scores, metrics['present']) if args.ap else None

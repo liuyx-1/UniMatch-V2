@@ -38,9 +38,10 @@ def _sobel_kernels(device, dtype):
 
 @torch.no_grad()
 def boundary_target_from_mask(mask: torch.Tensor, num_classes: int,
-                                ignore_index: int = 255) -> torch.Tensor:
+                              ignore_index: int = 255,
+                              ignore_dilation: int = 0) -> torch.Tensor:
     """Return a {0,1}-valued boundary target of shape [B, H, W]."""
-    valid = (mask != ignore_index).float()
+    valid = valid_without_ignore_halo(mask, ignore_index, ignore_dilation)
     safe = mask.clone()
     safe[mask == ignore_index] = 0
     oh = F.one_hot(safe.long(), num_classes).permute(0, 3, 1, 2).float()
@@ -51,6 +52,20 @@ def boundary_target_from_mask(mask: torch.Tensor, num_classes: int,
     gy = F.conv2d(x, ky, padding=1)
     mag = (gx ** 2 + gy ** 2).reshape(B, C, H, W).sum(dim=1).sqrt()
     return (mag > 0).float() * valid
+
+
+@torch.no_grad()
+def valid_without_ignore_halo(mask: torch.Tensor, ignore_index: int = 255,
+                              ignore_dilation: int = 0) -> torch.Tensor:
+    """Valid-pixel mask with an optional halo removed around ignore regions."""
+    valid = (mask != ignore_index).float()
+    dilation = max(0, int(ignore_dilation))
+    if dilation <= 0:
+        return valid
+    ignore = (mask == ignore_index).unsqueeze(1).float()
+    k = 2 * dilation + 1
+    halo = F.max_pool2d(ignore, kernel_size=k, stride=1, padding=dilation).squeeze(1)
+    return valid * (1.0 - halo)
 
 
 # ----------------------------------------------------------------------
@@ -120,7 +135,8 @@ def boundary_loss(boundary_logits: torch.Tensor, mask: torch.Tensor,
                     cutmix_box: Optional[torch.Tensor] = None,
                     cutmix_edge_thickness: int = 2,
                     dice_weight: float = 0.5,
-                    dice_eps: float = 1.0) -> torch.Tensor:
+                    dice_eps: float = 1.0,
+                    ignore_dilation: int = 0) -> torch.Tensor:
     """BCE + Dice on the Sobel boundary target, with CutMix-seam suppression.
 
     Args:
@@ -131,17 +147,20 @@ def boundary_loss(boundary_logits: torch.Tensor, mask: torch.Tensor,
         cutmix_box:              optional [B, H, W] in {0,1}; pixels near the
                                   outline are EXCLUDED from the loss.
         cutmix_edge_thickness:   how many pixels around the seam to drop.
+        ignore_dilation:         remove this many pixels around ignore_index
+                                  regions from target and loss gate.
         dice_weight:             Dice contribution; 0 = pure BCE, 1 = pure Dice,
                                   0.5 = recommended combo.
     """
-    target = boundary_target_from_mask(mask, num_classes, ignore_index)
+    target = boundary_target_from_mask(mask, num_classes, ignore_index,
+                                       ignore_dilation=ignore_dilation)
     if boundary_logits.shape[-2:] != target.shape[-2:]:
         boundary_logits = F.interpolate(boundary_logits, size=target.shape[-2:],
                                          mode='bilinear', align_corners=False)
     logits = boundary_logits.squeeze(1)
 
     # Per-pixel gate
-    gate = (mask != ignore_index).float()
+    gate = valid_without_ignore_halo(mask, ignore_index, ignore_dilation)
     if valid_mask is not None:
         gate = gate * valid_mask.float()
     if cutmix_box is not None:

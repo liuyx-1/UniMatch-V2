@@ -1,0 +1,27 @@
+# Small-backbone (DINOv2-small / vits14) variant of surgical_combined — for FAST
+# inference (the real-time stereo keypoint pipeline). Trained on left+right data
+# (build_combined_trainset.py --include-right).
+dataset: surgical_combined
+data_root: /root/autodl-tmp/data/surgical_seg      # unified root (contains ab/, march_1/, ...)
+nclass: 4                                          # background + needle/thread/clamps
+crop_size: 490
+
+epochs: 150
+batch_size: 16                                     # small backbone -> larger batch fits
+lr: 0.00001
+lr_multi: 10.0
+criterion:
+  name: CELoss
+  kwargs:
+    ignore_index: 255
+conf_thresh: 0.95
+
+model: dpt
+backbone: dinov2_small
+backbone_checkpoint: /root/autodl-tmp/code/UniMatch-V2_local/pretrained/dinov2_vits14_pretrain.pth
+lock_backbone: False
+
+boundary:
+  enabled: false
+cls:
+  enabled: false
