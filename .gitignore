@@ -16,7 +16,9 @@ runs/
 wandb/
 data/
 datasets/
-splits/
+splits/*
+!splits/ratio_0.10/
+!splits/ratio_0.10/**
 
 *.pth
 *.pt

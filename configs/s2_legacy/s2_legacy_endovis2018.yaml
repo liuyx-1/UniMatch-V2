@@ -1,0 +1,35 @@
+dataset: endovis2018
+data_root: /root/autodl-tmp/data/autonomous_surgery/public_data/endovis2018_processed
+nclass: 12
+crop_size: 490
+epochs: 80
+batch_size: 16
+eval_batch_size: 2
+num_workers: 2
+eval_num_workers: 2
+lr: 4.0e-5
+criterion:
+  name: CELoss
+  kwargs:
+    ignore_index: 255
+backbone: dinov2_base
+backbone_checkpoint: /root/autodl-tmp/code/UniMatch-V2_local/pretrained/dinov2_vitb14_pretrain.pth
+sasr:
+  stage1_checkpoint: /root/autodl-tmp/exp/sasr_s1_r010_coverage_v4_20260811_serial_retry1/endovis2018/best_val.pth
+  stage1_weights: model
+  anchor_checkpoint: /root/autodl-tmp/exp/text_anchors_gpt_20260801/endovis2018_gpt_siglip2_anchors.pth
+  adapter_reduction: 8
+  adapter_dropout: 0.0
+  edge_dropout: 0.05
+  dpt_lr_mult: 2.0
+  adapter_lr_mult: 4.0
+  text_lr_start_mult: 0.25
+  text_lr_mult: 1.0
+  warmup_epochs: 5
+  min_lr_ratio: 0.05
+  ema_decay: 0.996
+  text_loss_weight: 0.5
+  edge_loss_weight: 0.05
+  gradient_checkpointing: true
+  grad_clip: 1.0
+conf_thresh: 0.95
